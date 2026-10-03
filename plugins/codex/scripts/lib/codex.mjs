@@ -307,6 +307,10 @@ function createTurnCaptureState(threadId, options = {}) {
     resolveCompletion = resolve;
     rejectCompletion = reject;
   });
+  // The completion may be rejected after the caller already bailed out (for
+  // example when turn/start itself failed); never surface that as an
+  // unhandled rejection.
+  void completion.catch(() => {});
 
   return {
     threadId,
@@ -581,6 +585,26 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
     applyTurnNotification(state, message);
   });
 
+  // If the app-server process or broker connection goes away mid-turn, no
+  // `turn/completed` will ever arrive. Without this watcher the caller would
+  // wait forever (or the process would silently drain and exit 0), leaving the
+  // job stuck in "running".
+  let settled = false;
+  const onConnectionLost = () => {
+    if (state.completed || settled) {
+      return;
+    }
+    state.completed = true;
+    clearCompletionTimer(state);
+    const detail = client.exitError?.message ?? state.error?.message ?? null;
+    const summary = `The connection to the Codex app-server closed before the turn completed${
+      state.turnId ? ` (turn ${state.turnId})` : ""
+    }.`;
+    emitProgress(state.onProgress, `Codex error: ${detail ? `${summary} ${detail}` : summary}`, "failed");
+    state.rejectCompletion(new Error(detail ? `${summary}\n${detail}` : summary));
+  };
+  void client.exitPromise?.then(onConnectionLost);
+
   try {
     const response = await startRequest();
     options.onResponse?.(response, state);
@@ -605,6 +629,7 @@ async function captureTurn(client, threadId, startRequest, options = {}) {
 
     return await state.completion;
   } finally {
+    settled = true;
     clearCompletionTimer(state);
     client.setNotificationHandler(previousHandler ?? null);
   }

@@ -1143,8 +1143,10 @@ test("status shows phases, hints, and the latest finished job", () => {
 
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /Active jobs:/);
-  assert.match(result.stdout, /\| Job \| Kind \| Status \| Phase \| Elapsed \| Codex Session ID \| Summary \| Actions \|/);
-  assert.match(result.stdout, /\| review-live \| review \| running \| reviewing \| .* \| thr_1 \| Review working tree diff \|/);
+  assert.match(result.stdout, /\| Job \| Kind \| Status \| Phase \| Elapsed \| Last Activity \| Codex Session ID \| Summary \| Actions \|/);
+  assert.match(result.stdout, /\| review-live \| review \| running \| reviewing \| .* \| .*ago \(possibly stalled\) \| thr_1 \| Review working tree diff \|/);
+  assert.match(result.stdout, /Last activity: .*ago \(possibly stalled\)/);
+  assert.match(result.stdout, /Warning: no Codex activity for .*\/codex:cancel review-live/);
   assert.match(result.stdout, /`\/codex:status review-live`<br>`\/codex:cancel review-live`/);
   assert.match(result.stdout, /Live details:/);
   assert.match(result.stdout, /Latest finished:/);
@@ -2256,4 +2258,521 @@ test("setup and status honor --cwd when reading shared session runtime", () => {
   const payload = JSON.parse(setup.stdout);
   assert.equal(payload.sessionRuntime.mode, "shared");
   assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
+});
+
+// ---------------------------------------------------------------------------
+// Job liveness: a job must never be reported as active after its worker died,
+// and a worker must never die silently while its job still says "running".
+// ---------------------------------------------------------------------------
+
+function prepareRepo() {
+  const repo = makeTempDir();
+  initGitRepo(repo);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello\n");
+  run("git", ["add", "README.md"], { cwd: repo });
+  run("git", ["commit", "-m", "init"], { cwd: repo });
+  return repo;
+}
+
+function endSession(repo, env) {
+  return run("node", [SESSION_HOOK, "SessionEnd"], {
+    cwd: repo,
+    env,
+    input: JSON.stringify({ hook_event_name: "SessionEnd", cwd: repo })
+  });
+}
+
+function isPidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== "ESRCH";
+  }
+}
+
+async function spawnExitedProcessPid() {
+  const child = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
+  await new Promise((resolve) => child.on("exit", resolve));
+  await waitFor(() => !isPidAlive(child.pid));
+  return child.pid;
+}
+
+function writeRunningJobFixture(workspace, jobId, extra = {}, storedExtra = {}) {
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  const logFile = path.join(jobsDir, `${jobId}.log`);
+  fs.writeFileSync(logFile, "[2026-03-18T15:30:00.000Z] Starting Codex Task.\n", "utf8");
+  const indexed = {
+    id: jobId,
+    kind: "task",
+    status: "running",
+    title: "Codex Task",
+    jobClass: "task",
+    summary: "Investigate flaky test",
+    threadId: "thr_dead",
+    logFile,
+    createdAt: "2026-03-18T15:30:00.000Z",
+    startedAt: "2026-03-18T15:30:01.000Z",
+    updatedAt: "2026-03-18T15:30:02.000Z",
+    ...extra
+  };
+  fs.writeFileSync(path.join(jobsDir, `${jobId}.json`), JSON.stringify({ ...indexed, ...storedExtra }, null, 2), "utf8");
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify({ version: 1, config: { stopReviewGate: false }, jobs: [indexed] }, null, 2)}\n`,
+    "utf8"
+  );
+  return { stateDir, jobsDir, logFile };
+}
+
+test("status marks a running job failed when its worker process no longer exists", async () => {
+  const workspace = makeTempDir();
+  const deadPid = await spawnExitedProcessPid();
+  const { stateDir, jobsDir, logFile } = writeRunningJobFixture(workspace, "task-dead", { pid: deadPid });
+
+  const status = run("node", [SCRIPT, "status", "task-dead", "--json"], { cwd: workspace });
+  assert.equal(status.status, 0, status.stderr);
+  const payload = JSON.parse(status.stdout);
+  assert.equal(payload.job.status, "failed");
+  assert.equal(payload.job.phase, "failed");
+  assert.equal(payload.job.pid, null);
+  assert.match(payload.job.errorMessage, new RegExp(`pid ${deadPid}\\) is no longer running`));
+  assert.match(payload.job.errorMessage, /codex resume thr_dead/);
+
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(state.jobs[0].status, "failed");
+  const stored = JSON.parse(fs.readFileSync(path.join(jobsDir, "task-dead.json"), "utf8"));
+  assert.equal(stored.status, "failed");
+  assert.match(fs.readFileSync(logFile, "utf8"), /stopped without recording a result/);
+
+  // The dead job must not count as active anywhere else either.
+  const cancel = run("node", [SCRIPT, "cancel", "--json"], { cwd: workspace });
+  assert.notEqual(cancel.status, 0);
+  assert.match(cancel.stderr, /No active Codex jobs to cancel/);
+
+  const rendered = run("node", [SCRIPT, "status"], { cwd: workspace });
+  assert.equal(rendered.status, 0, rendered.stderr);
+  assert.doesNotMatch(rendered.stdout, /Active jobs:/);
+  assert.match(rendered.stdout, /Error: Codex job task-dead stopped without recording a result/);
+});
+
+test("status marks a running job failed when its heartbeat went stale even though the pid is reused", async () => {
+  const workspace = makeTempDir();
+  // Our own pid is definitely alive; a stale heartbeat must still flag the job.
+  writeRunningJobFixture(workspace, "task-stale", { pid: process.pid }, { heartbeatAt: "2026-03-18T15:30:05.000Z" });
+
+  const status = run("node", [SCRIPT, "status", "task-stale", "--json"], { cwd: workspace });
+  assert.equal(status.status, 0, status.stderr);
+  const payload = JSON.parse(status.stdout);
+  assert.equal(payload.job.status, "failed");
+  assert.match(payload.job.errorMessage, /stopped sending heartbeats/);
+});
+
+test("status leaves a running job alone while its worker is alive and recently active", async (t) => {
+  const workspace = makeTempDir();
+  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  t.after(() => {
+    try {
+      sleeper.kill("SIGTERM");
+    } catch {
+      // ignore
+    }
+  });
+  const recent = new Date().toISOString();
+  writeRunningJobFixture(
+    workspace,
+    "task-alive",
+    { pid: sleeper.pid, startedAt: recent, updatedAt: recent },
+    { heartbeatAt: recent, lastActivityAt: recent }
+  );
+
+  const status = run("node", [SCRIPT, "status", "task-alive", "--json"], { cwd: workspace });
+  assert.equal(status.status, 0, status.stderr);
+  const payload = JSON.parse(status.stdout);
+  assert.equal(payload.job.status, "running");
+  assert.equal(payload.job.workerAlive, true);
+  assert.equal(payload.job.possiblyStalled, false);
+  assert.ok(payload.job.idle);
+});
+
+test("status flags a live job as possibly stalled after the configured idle threshold", async (t) => {
+  const workspace = makeTempDir();
+  const sleeper = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+  t.after(() => {
+    try {
+      sleeper.kill("SIGTERM");
+    } catch {
+      // ignore
+    }
+  });
+  const now = new Date().toISOString();
+  const twoMinutesAgo = new Date(Date.now() - 2 * 60 * 1000).toISOString();
+  writeRunningJobFixture(
+    workspace,
+    "task-quiet",
+    { pid: sleeper.pid, startedAt: twoMinutesAgo, updatedAt: twoMinutesAgo },
+    { heartbeatAt: now, lastActivityAt: twoMinutesAgo }
+  );
+
+  const status = run("node", [SCRIPT, "status", "task-quiet", "--json"], {
+    cwd: workspace,
+    env: { ...process.env, CODEX_COMPANION_STALL_AFTER_MS: "60000" }
+  });
+  assert.equal(status.status, 0, status.stderr);
+  const payload = JSON.parse(status.stdout);
+  assert.equal(payload.job.status, "running");
+  assert.equal(payload.job.possiblyStalled, true);
+
+  const rendered = run("node", [SCRIPT, "status", "task-quiet"], {
+    cwd: workspace,
+    env: { ...process.env, CODEX_COMPANION_STALL_AFTER_MS: "60000" }
+  });
+  assert.match(rendered.stdout, /Last activity: .*\(possibly stalled\)/);
+  assert.match(rendered.stdout, /Warning: no Codex activity for/);
+  assert.match(rendered.stdout, /Wait: \/codex:status task-quiet --wait/);
+});
+
+test("status adopts a terminal result from the job file when the index entry went stale", () => {
+  const workspace = makeTempDir();
+  const { stateDir } = writeRunningJobFixture(
+    workspace,
+    "task-lost-update",
+    { pid: null },
+    {
+      status: "completed",
+      phase: "done",
+      completedAt: "2026-03-18T15:31:00.000Z",
+      threadId: "thr_done",
+      summary: "Handled the requested task.",
+      result: { status: 0, rawOutput: "Handled the requested task.\n" },
+      rendered: "Handled the requested task.\n"
+    }
+  );
+
+  const status = run("node", [SCRIPT, "status", "task-lost-update", "--json"], { cwd: workspace });
+  assert.equal(status.status, 0, status.stderr);
+  const payload = JSON.parse(status.stdout);
+  assert.equal(payload.job.status, "completed");
+  assert.equal(payload.job.threadId, "thr_done");
+  assert.equal(payload.job.summary, "Handled the requested task.");
+
+  const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+  assert.equal(state.jobs[0].status, "completed");
+
+  const result = run("node", [SCRIPT, "result", "task-lost-update"], { cwd: workspace });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Handled the requested task/);
+});
+
+test("status marks a queued job failed when its worker never started", () => {
+  const workspace = makeTempDir();
+  writeRunningJobFixture(workspace, "task-never-started", { status: "queued", phase: "queued", pid: null, startedAt: undefined });
+
+  const status = run("node", [SCRIPT, "status", "task-never-started", "--json"], { cwd: workspace });
+  assert.equal(status.status, 0, status.stderr);
+  const payload = JSON.parse(status.stdout);
+  assert.equal(payload.job.status, "failed");
+  assert.match(payload.job.errorMessage, /background worker never started/);
+});
+
+test("foreground task keeps running and records its result when the companion process is killed", async (t) => {
+  const repo = prepareRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "interruptible-slow-task"); // 5s turn
+  const env = { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: "sess-killed" };
+  t.after(() => endSession(repo, env));
+
+  const child = spawn("node", [SCRIPT, "task", "investigate the slow thing"], {
+    cwd: repo,
+    env,
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk;
+  });
+
+  const stateDir = resolveStateDir(repo);
+  const job = await waitFor(() => {
+    const stateFile = path.join(stateDir, "state.json");
+    if (!fs.existsSync(stateFile)) {
+      return null;
+    }
+    const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
+    const candidate = state.jobs[0];
+    return candidate?.status === "running" && candidate.turnId ? candidate : null;
+  }, { timeoutMs: 15000 });
+
+  // Simulate Claude Code killing the Bash call (timeout).
+  child.kill("SIGTERM");
+  await new Promise((resolve) => child.on("exit", resolve));
+  assert.match(stderr, new RegExp(`started as ${job.id}`));
+  assert.match(stderr, /the job keeps running/);
+  assert.equal(isPidAlive(job.pid), true, "the detached worker must survive the companion being killed");
+
+  const waited = run("node", [SCRIPT, "status", job.id, "--wait", "--timeout-ms", "20000", "--json"], { cwd: repo, env });
+  assert.equal(waited.status, 0, waited.stderr);
+  const payload = JSON.parse(waited.stdout);
+  assert.equal(payload.job.status, "completed");
+
+  const result = run("node", [SCRIPT, "result", job.id], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Handled the requested task/);
+});
+
+test("foreground task reports a still-running notice instead of being killed when the wait budget runs out", async (t) => {
+  const repo = prepareRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "interruptible-slow-task"); // 5s turn
+  const env = { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: "sess-budget" };
+  t.after(() => endSession(repo, env));
+
+  const result = run("node", [SCRIPT, "task", "--wait-timeout-ms", "1500", "take your time"], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /still running/);
+  assert.match(result.stdout, /It keeps running in the background; nothing was lost/);
+  const jobId = /Job (task-[a-z0-9-]+) is still/.exec(result.stdout)?.[1];
+  assert.ok(jobId, result.stdout);
+  assert.match(result.stdout, new RegExp(`/codex:status ${jobId} --wait`));
+
+  const asJson = run("node", [SCRIPT, "task", "--wait-timeout-ms", "0", "--json", "finish quickly please"], {
+    cwd: repo,
+    env: { ...env, CODEX_COMPANION_WAIT_TIMEOUT_MS: "1" }
+  });
+  // An explicit --wait-timeout-ms 0 waits for completion regardless of the env default.
+  assert.equal(asJson.status, 0, asJson.stderr);
+  assert.match(JSON.parse(asJson.stdout).rawOutput, /Handled the requested task/);
+
+  const waited = run("node", [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "20000", "--json"], { cwd: repo, env });
+  assert.equal(waited.status, 0, waited.stderr);
+  assert.equal(JSON.parse(waited.stdout).job.status, "completed");
+});
+
+test("task fails visibly when the codex app-server dies mid-turn and the shared broker shuts down", async (t) => {
+  const repo = prepareRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "crash-mid-turn");
+  const env = { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: "sess-crash" };
+  t.after(() => endSession(repo, env));
+
+  const result = run("node", [SCRIPT, "task", "do something"], { cwd: repo, env });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /closed before the turn completed/);
+
+  const status = run("node", [SCRIPT, "status", "--json"], { cwd: repo, env });
+  assert.equal(status.status, 0, status.stderr);
+  const payload = JSON.parse(status.stdout);
+  assert.equal(payload.running.length, 0);
+  assert.equal(payload.latestFinished.status, "failed");
+  assert.match(payload.latestFinished.errorMessage, /closed before the turn completed/);
+
+  // The broker must not linger as a zombie in front of a dead app-server.
+  const brokerSession = loadBrokerSession(repo);
+  if (brokerSession?.endpoint?.startsWith("unix:")) {
+    const socketPath = brokerSession.endpoint.slice("unix:".length);
+    await waitFor(() => !fs.existsSync(socketPath), { timeoutMs: 5000 });
+  }
+
+  // A later command recovers by starting a fresh runtime instead of hanging.
+  installFakeCodex(binDir, "slow-task");
+  const recovered = run("node", [SCRIPT, "task", "--wait-timeout-ms", "20000", "try again"], { cwd: repo, env });
+  assert.equal(recovered.status, 0, recovered.stderr);
+  assert.match(recovered.stdout, /Handled the requested task/);
+});
+
+test("broker interrupts a turn whose worker was killed and status reports the loss", async (t) => {
+  const repo = prepareRepo();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "interruptible-slow-task");
+  const env = { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: "sess-orphan" };
+  t.after(() => endSession(repo, env));
+
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "investigate the orphaned worker"], { cwd: repo, env });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+
+  const stateDir = resolveStateDir(repo);
+  const runningJob = await waitFor(() => {
+    const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+    const job = state.jobs.find((candidate) => candidate.id === jobId);
+    return job?.status === "running" && job.threadId && job.turnId ? job : null;
+  }, { timeoutMs: 15000 });
+
+  const brokerSession = loadBrokerSession(repo);
+  if (!brokerSession) {
+    return;
+  }
+
+  // SIGKILL leaves no chance for the worker to record anything itself.
+  process.kill(runningJob.pid, "SIGKILL");
+  await waitFor(() => !isPidAlive(runningJob.pid));
+
+  const interrupted = await waitFor(() => JSON.parse(fs.readFileSync(fakeStatePath, "utf8")).lastInterrupt ?? null, {
+    timeoutMs: 5000
+  });
+  assert.deepEqual(interrupted, { threadId: runningJob.threadId, turnId: runningJob.turnId });
+
+  const status = run("node", [SCRIPT, "status", jobId, "--json"], { cwd: repo, env });
+  assert.equal(status.status, 0, status.stderr);
+  const payload = JSON.parse(status.stdout);
+  assert.equal(payload.job.status, "failed");
+  assert.match(payload.job.errorMessage, /is no longer running/);
+});
+
+test("review runs through a detached worker and still returns the rendered result inline", (t) => {
+  const repo = prepareRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  fs.writeFileSync(path.join(repo, "README.md"), "hello again\n");
+  const env = { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: "sess-review" };
+  t.after(() => endSession(repo, env));
+
+  const review = run("node", [SCRIPT, "review"], { cwd: repo, env });
+  assert.equal(review.status, 0, review.stderr);
+  assert.match(review.stdout, /# Codex Review/);
+  assert.match(review.stdout, /No material issues found/);
+  assert.match(review.stderr, /started as review-/);
+  assert.match(review.stderr, /\[codex\] Thread ready/);
+
+  const state = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "state.json"), "utf8"));
+  assert.equal(state.jobs[0].status, "completed");
+  assert.equal(state.jobs[0].pid, null);
+});
+
+test("status marks a queued job failed when its pid is alive but the worker never started", () => {
+  const workspace = makeTempDir();
+  // Our own pid is alive (simulating pid reuse); no heartbeat was ever written.
+  writeRunningJobFixture(workspace, "task-boot-crash", {
+    status: "queued",
+    phase: "queued",
+    pid: process.pid,
+    startedAt: undefined
+  });
+
+  const status = run("node", [SCRIPT, "status", "task-boot-crash", "--json"], { cwd: workspace });
+  assert.equal(status.status, 0, status.stderr);
+  const payload = JSON.parse(status.stdout);
+  assert.equal(payload.job.status, "failed");
+  assert.match(payload.job.errorMessage, /never started running the job/);
+});
+
+test("cancel refuses to clobber a job that finished first and keeps its result", () => {
+  const workspace = makeTempDir();
+  const stateDir = resolveStateDir(workspace);
+  const jobsDir = path.join(stateDir, "jobs");
+  fs.mkdirSync(jobsDir, { recursive: true });
+  const logFile = path.join(jobsDir, "task-done.log");
+  fs.writeFileSync(logFile, "[2026-03-18T15:30:00.000Z] Starting Codex Task.\n", "utf8");
+  // Index still says running (stale), but the worker already stored a result.
+  fs.writeFileSync(
+    path.join(jobsDir, "task-done.json"),
+    JSON.stringify(
+      {
+        id: "task-done",
+        status: "completed",
+        phase: "done",
+        completedAt: "2026-03-18T15:31:00.000Z",
+        logFile,
+        result: { status: 0, rawOutput: "All done.\n" },
+        rendered: "All done.\n"
+      },
+      null,
+      2
+    ),
+    "utf8"
+  );
+  fs.writeFileSync(
+    path.join(stateDir, "state.json"),
+    `${JSON.stringify(
+      {
+        version: 1,
+        config: { stopReviewGate: false },
+        jobs: [
+          {
+            id: "task-done",
+            status: "running",
+            title: "Codex Task",
+            jobClass: "task",
+            pid: process.pid,
+            logFile,
+            createdAt: "2026-03-18T15:30:00.000Z",
+            startedAt: "2026-03-18T15:30:01.000Z",
+            updatedAt: "2026-03-18T15:30:02.000Z"
+          }
+        ]
+      },
+      null,
+      2
+    )}\n`,
+    "utf8"
+  );
+
+  const cancel = run("node", [SCRIPT, "cancel", "task-done", "--json"], { cwd: workspace });
+  assert.notEqual(cancel.status, 0);
+  assert.match(cancel.stderr, /Job task-done is already completed; there is nothing to cancel/);
+
+  const stored = JSON.parse(fs.readFileSync(path.join(jobsDir, "task-done.json"), "utf8"));
+  assert.equal(stored.status, "completed");
+  assert.equal(stored.rendered, "All done.\n");
+  const result = run("node", [SCRIPT, "result", "task-done"], { cwd: workspace });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /All done\./);
+});
+
+test("cancelling a live brokered task records cancelled, not a SIGTERM failure", async (t) => {
+  const repo = prepareRepo();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "interruptible-slow-task");
+  const env = { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: "sess-cancel-live" };
+  t.after(() => endSession(repo, env));
+
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "take a while"], { cwd: repo, env });
+  assert.equal(launched.status, 0, launched.stderr);
+  const jobId = JSON.parse(launched.stdout).jobId;
+
+  const stateDir = resolveStateDir(repo);
+  const runningJob = await waitFor(() => {
+    const state = JSON.parse(fs.readFileSync(path.join(stateDir, "state.json"), "utf8"));
+    const job = state.jobs.find((candidate) => candidate.id === jobId);
+    return job?.status === "running" && job.turnId ? job : null;
+  }, { timeoutMs: 15000 });
+
+  const cancel = run("node", [SCRIPT, "cancel", jobId, "--json"], { cwd: repo, env });
+  assert.equal(cancel.status, 0, cancel.stderr);
+  await waitFor(() => !isPidAlive(runningJob.pid));
+  // Give the worker's own exit path a moment to (not) overwrite the outcome.
+  await new Promise((resolve) => setTimeout(resolve, 300));
+
+  const status = run("node", [SCRIPT, "status", jobId, "--json"], { cwd: repo, env });
+  assert.equal(status.status, 0, status.stderr);
+  const payload = JSON.parse(status.stdout);
+  assert.equal(payload.job.status, "cancelled");
+  assert.equal(payload.job.errorMessage, "Cancelled by user.");
+  const stored = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", `${jobId}.json`), "utf8"));
+  assert.equal(stored.status, "cancelled");
+});
+
+test("a graceful client disconnect does not make the broker interrupt the turn", async (t) => {
+  const repo = prepareRepo();
+  const binDir = makeTempDir();
+  const fakeStatePath = path.join(binDir, "fake-codex-state.json");
+  installFakeCodex(binDir, "with-subagent-no-main-turn-completed");
+  const env = { ...buildEnv(binDir), CODEX_COMPANION_SESSION_ID: "sess-release" };
+  t.after(() => endSession(repo, env));
+
+  const result = run("node", [SCRIPT, "task", "--wait-timeout-ms", "20000", "investigate with a subagent"], { cwd: repo, env });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stdout, /Handled the requested task/);
+
+  if (!loadBrokerSession(repo)) {
+    return;
+  }
+  // The worker finished by inferred completion and closed its socket
+  // gracefully; the broker must not have interrupted the turn.
+  await new Promise((resolve) => setTimeout(resolve, 500));
+  const fakeState = JSON.parse(fs.readFileSync(fakeStatePath, "utf8"));
+  assert.equal(fakeState.lastInterrupt ?? null, null);
 });

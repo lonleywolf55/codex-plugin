@@ -4,8 +4,23 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+
 import { makeTempDir } from "./helpers.mjs";
-import { resolveJobFile, resolveJobLogFile, resolveStateDir, resolveStateFile, saveState } from "../plugins/codex/scripts/lib/state.mjs";
+import {
+  patchJobFile,
+  resolveJobFile,
+  resolveJobLogFile,
+  resolveStateDir,
+  resolveStateFile,
+  saveState,
+  upsertJob,
+  withStateLock,
+  writeJobFile
+} from "../plugins/codex/scripts/lib/state.mjs";
+
+const STATE_MODULE = fileURLToPath(new URL("../plugins/codex/scripts/lib/state.mjs", import.meta.url));
 
 test("resolveStateDir uses a temp-backed per-workspace directory", () => {
   const workspace = makeTempDir();
@@ -102,4 +117,63 @@ test("saveState prunes dropped job artifacts when indexed jobs exceed the cap", 
       .flatMap((jobId) => [`${jobId}.json`, `${jobId}.log`])
       .sort()
   );
+});
+
+test("concurrent upsertJob calls from separate processes never lose updates", async () => {
+  const workspace = makeTempDir();
+  const writers = 6;
+  const perWriter = 7; // keep the total under the 50-job index cap so every write is observable
+
+  const script = `
+    import { upsertJob } from ${JSON.stringify(STATE_MODULE)};
+    const [workspace, writer, count] = process.argv.slice(2);
+    for (let index = 0; index < Number(count); index += 1) {
+      upsertJob(workspace, { id: \`job-\${writer}-\${index}\`, status: "completed" });
+    }
+  `;
+  const scriptPath = path.join(makeTempDir(), "writer.mjs");
+  fs.writeFileSync(scriptPath, script, "utf8");
+
+  await Promise.all(
+    Array.from({ length: writers }, (_, writer) =>
+      new Promise((resolve, reject) => {
+        const child = spawn(process.execPath, [scriptPath, workspace, String(writer), String(perWriter)], { stdio: "inherit" });
+        child.on("exit", (code) => (code === 0 ? resolve() : reject(new Error(`writer ${writer} exited ${code}`))));
+      })
+    )
+  );
+
+  const state = JSON.parse(fs.readFileSync(resolveStateFile(workspace), "utf8"));
+  assert.equal(state.jobs.length, writers * perWriter);
+  assert.equal(fs.existsSync(path.join(resolveStateDir(workspace), "state.lock")), false);
+});
+
+test("withStateLock is re-entrant and reclaims stale locks", () => {
+  const workspace = makeTempDir();
+  const lockDir = path.join(resolveStateDir(workspace), "state.lock");
+  fs.mkdirSync(lockDir, { recursive: true });
+  const stale = new Date(Date.now() - 60 * 1000);
+  fs.utimesSync(lockDir, stale, stale);
+
+  const started = Date.now();
+  const value = withStateLock(workspace, () => withStateLock(workspace, () => "nested"));
+  assert.equal(value, "nested");
+  assert.ok(Date.now() - started < 4000, "a stale lock must be reclaimed quickly");
+  assert.equal(fs.existsSync(lockDir), false);
+});
+
+test("patchJobFile merges into the stored job and supports conditional patches", () => {
+  const workspace = makeTempDir();
+  assert.equal(patchJobFile(workspace, "missing", { pid: 1 }), null);
+
+  writeJobFile(workspace, "job-1", { id: "job-1", status: "running", pid: null });
+  const merged = patchJobFile(workspace, "job-1", { heartbeatAt: "2026-01-01T00:00:00.000Z" });
+  assert.equal(merged.status, "running");
+  assert.equal(merged.heartbeatAt, "2026-01-01T00:00:00.000Z");
+
+  const conditional = patchJobFile(workspace, "job-1", (existing) => (existing.pid == null ? { pid: 4242 } : {}));
+  assert.equal(conditional.pid, 4242);
+  const unchanged = patchJobFile(workspace, "job-1", (existing) => (existing.pid == null ? { pid: 1 } : {}));
+  assert.equal(unchanged.pid, 4242);
+  assert.equal(JSON.parse(fs.readFileSync(resolveJobFile(workspace, "job-1"), "utf8")).pid, 4242);
 });

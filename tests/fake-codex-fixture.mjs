@@ -585,6 +585,13 @@ rl.on("line", (line) => {
           }
         ];
 
+	        if (BEHAVIOR === "crash-mid-turn") {
+	          // Simulate the codex app-server dying while a turn is in flight.
+	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+	          setTimeout(() => process.exit(1), 200);
+	          break;
+	        }
+
 	        if (BEHAVIOR === "interruptible-slow-task") {
 	          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
 	          const timer = setTimeout(() => {

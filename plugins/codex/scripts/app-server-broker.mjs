@@ -6,7 +6,12 @@ import path from "node:path";
 import process from "node:process";
 
 import { parseArgs } from "./lib/args.mjs";
-import { BROKER_BUSY_RPC_CODE, CodexAppServerClient } from "./lib/app-server.mjs";
+import {
+  BROKER_APP_SERVER_EXITED_METHOD,
+  BROKER_BUSY_RPC_CODE,
+  BROKER_RELEASE_METHOD,
+  CodexAppServerClient
+} from "./lib/app-server.mjs";
 import { parseBrokerEndpoint } from "./lib/broker-endpoint.mjs";
 
 const STREAMING_METHODS = new Set(["turn/start", "review/start", "thread/compact/start"]);
@@ -20,6 +25,18 @@ function buildStreamThreadIds(method, params, result) {
     threadIds.add(result.reviewThreadId);
   }
   return threadIds;
+}
+
+function buildStreamTurn(method, params, result) {
+  const turnId = result?.turn?.id ?? null;
+  if (!turnId) {
+    return null;
+  }
+  const threadId = (method === "review/start" ? result?.reviewThreadId : null) ?? params?.threadId ?? null;
+  if (!threadId) {
+    return null;
+  }
+  return { threadId, turnId };
 }
 
 function buildJsonRpcError(code, message, data) {
@@ -69,15 +86,31 @@ async function main() {
   let activeRequestSocket = null;
   let activeStreamSocket = null;
   let activeStreamThreadIds = null;
+  let activeStreamTurn = null;
+  let shuttingDown = false;
   const sockets = new Set();
+  const releasedSockets = new Set();
 
-  function clearSocketOwnership(socket) {
+  function clearActiveStream() {
+    activeStreamSocket = null;
+    activeStreamThreadIds = null;
+    activeStreamTurn = null;
+  }
+
+  function clearSocketOwnership(socket, options = {}) {
     if (activeRequestSocket === socket) {
       activeRequestSocket = null;
     }
     if (activeStreamSocket === socket) {
-      activeStreamSocket = null;
-      activeStreamThreadIds = null;
+      const orphanedTurn = activeStreamTurn;
+      clearActiveStream();
+      // A client that disconnects without announcing it (its process was
+      // killed or crashed) will never collect the result, so stop the turn
+      // instead of letting Codex keep working for no one. A deliberate
+      // release (graceful close) leaves the turn alone.
+      if (orphanedTurn && !options.released && !shuttingDown) {
+        appClient.request("turn/interrupt", orphanedTurn).catch(() => {});
+      }
     }
   }
 
@@ -90,8 +123,7 @@ async function main() {
     if (message.method === "turn/completed" && activeStreamSocket === target) {
       const threadId = message.params?.threadId ?? null;
       if (!threadId || !activeStreamThreadIds || activeStreamThreadIds.has(threadId)) {
-        activeStreamSocket = null;
-        activeStreamThreadIds = null;
+        clearActiveStream();
         if (activeRequestSocket === target) {
           activeRequestSocket = null;
         }
@@ -100,6 +132,7 @@ async function main() {
   }
 
   async function shutdown(server) {
+    shuttingDown = true;
     for (const socket of sockets) {
       socket.end();
     }
@@ -157,6 +190,12 @@ async function main() {
           continue;
         }
 
+        if (message.method === BROKER_RELEASE_METHOD && message.id === undefined) {
+          releasedSockets.add(socket);
+          clearSocketOwnership(socket, { released: true });
+          continue;
+        }
+
         if (message.id !== undefined && message.method === "broker/shutdown") {
           send(socket, { id: message.id, result: {} });
           await shutdown(server);
@@ -201,8 +240,17 @@ async function main() {
           const result = await appClient.request(message.method, message.params ?? {});
           send(socket, { id: message.id, result });
           if (isStreaming) {
-            activeStreamSocket = socket;
-            activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
+            if (socket.destroyed) {
+              // The requester vanished while the turn was starting.
+              const startedTurn = buildStreamTurn(message.method, message.params ?? {}, result);
+              if (startedTurn && !shuttingDown) {
+                appClient.request("turn/interrupt", startedTurn).catch(() => {});
+              }
+            } else {
+              activeStreamSocket = socket;
+              activeStreamThreadIds = buildStreamThreadIds(message.method, message.params ?? {}, result);
+              activeStreamTurn = buildStreamTurn(message.method, message.params ?? {}, result);
+            }
           }
           if (activeRequestSocket === socket) {
             activeRequestSocket = null;
@@ -216,7 +264,7 @@ async function main() {
             activeRequestSocket = null;
           }
           if (activeStreamSocket === socket && !isStreaming) {
-            activeStreamSocket = null;
+            clearActiveStream();
           }
         }
       }
@@ -224,12 +272,14 @@ async function main() {
 
     socket.on("close", () => {
       sockets.delete(socket);
-      clearSocketOwnership(socket);
+      clearSocketOwnership(socket, { released: releasedSockets.has(socket) });
+      releasedSockets.delete(socket);
     });
 
     socket.on("error", () => {
       sockets.delete(socket);
-      clearSocketOwnership(socket);
+      clearSocketOwnership(socket, { released: releasedSockets.has(socket) });
+      releasedSockets.delete(socket);
     });
   });
 
@@ -241,6 +291,23 @@ async function main() {
   process.on("SIGINT", async () => {
     await shutdown(server);
     process.exit(0);
+  });
+
+  // If the codex app-server behind this broker dies, the broker must not keep
+  // accepting connections as if everything were fine: clients streaming a turn
+  // would wait forever and new commands would hang. Tell every client why,
+  // close the endpoint so the next command starts a fresh runtime, and exit.
+  void appClient.exitPromise.then(async () => {
+    if (shuttingDown) {
+      return;
+    }
+    const detail = appClient.exitError?.message ?? "The shared codex app-server exited unexpectedly.";
+    process.stderr.write(`${detail}\n`);
+    for (const socket of sockets) {
+      send(socket, { method: BROKER_APP_SERVER_EXITED_METHOD, params: { message: detail } });
+    }
+    await shutdown(server);
+    process.exit(1);
   });
 
   server.listen(listenTarget.path);

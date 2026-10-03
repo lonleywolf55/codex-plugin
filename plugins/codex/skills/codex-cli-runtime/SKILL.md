@@ -13,6 +13,7 @@ Primary helper:
 
 Execution rules:
 - The rescue subagent is a forwarder, not an orchestrator. Its only job is to invoke `task` once and return that stdout unchanged.
+- Pass `timeout: 600000` on the `Bash` call. The Codex run executes in a detached worker and `task` follows it for up to `--wait-timeout-ms` (default 9.5 minutes); when that budget runs out it prints a "still running" notice with the job id and follow-up commands. Return that notice as-is; it is a successful result, not a failure, and the job keeps running.
 - Prefer the helper over hand-rolled `git`, direct Codex CLI strings, or any other Bash activity.
 - Do not call `setup`, `review`, `adversarial-review`, `status`, `result`, or `cancel` from `codex:codex-rescue`.
 - Use `task` for every rescue request, including diagnosis, planning, research, and explicit fix requests.

@@ -4,6 +4,7 @@ import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
+import { StringDecoder } from "node:string_decoder";
 import { fileURLToPath } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
@@ -29,19 +30,28 @@ import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import {
   generateJobId,
   getConfig,
-  listJobs,
+  patchJobFile,
   setConfig,
   upsertJob,
+  withStateLock,
   writeJobFile
 } from "./lib/state.mjs";
 import {
   buildSingleJobSnapshot,
   buildStatusSnapshot,
+  isProgressBlockTitle,
   readStoredJob,
   resolveCancelableJob,
   resolveResultJob,
   sortJobsNewestFirst
 } from "./lib/job-control.mjs";
+import {
+  formatDuration,
+  isActiveJobStatus,
+  listReconciledJobs,
+  markJobCancelledIfActive,
+  markJobFailedIfActive
+} from "./lib/liveness.mjs";
 import {
   appendLogLine,
   createJobLogFile,
@@ -61,6 +71,7 @@ import {
   renderJobStatusReport,
   renderSetupReport,
   renderStatusReport,
+  renderStillRunningNotice,
   renderTaskResult
 } from "./lib/render.mjs";
 
@@ -68,6 +79,13 @@ const ROOT_DIR = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
 const REVIEW_SCHEMA = path.join(ROOT_DIR, "schemas", "review-output.schema.json");
 const DEFAULT_STATUS_WAIT_TIMEOUT_MS = 240000;
 const DEFAULT_STATUS_POLL_INTERVAL_MS = 2000;
+// Foreground commands wait this long for the detached worker before handing
+// back a "still running" notice. Claude Code's Bash tool allows at most 10
+// minutes per call, so stay under that and let the caller re-attach with
+// `/codex:status <id> --wait` instead of being killed mid-wait.
+const DEFAULT_FOREGROUND_WAIT_TIMEOUT_MS = 570000;
+const FOREGROUND_WAIT_TIMEOUT_ENV = "CODEX_COMPANION_WAIT_TIMEOUT_MS";
+const ATTACH_POLL_INTERVAL_MS = 500;
 const VALID_REASONING_EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh"]);
 const MODEL_ALIASES = new Map([["spark", "gpt-5.3-codex-spark"]]);
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
@@ -77,9 +95,9 @@ function printUsage() {
     [
       "Usage:",
       "  node scripts/codex-companion.mjs setup [--enable-review-gate|--disable-review-gate] [--json]",
-      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>]",
-      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
-      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
+      "  node scripts/codex-companion.mjs review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--wait-timeout-ms <ms>]",
+      "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [--wait-timeout-ms <ms>] [focus text]",
+      "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [--wait-timeout-ms <ms>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
       "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
       "  node scripts/codex-companion.mjs result [job-id] [--json]",
@@ -287,8 +305,16 @@ function renderStatusPayload(report, asJson) {
   return asJson ? report : renderStatusReport(report);
 }
 
-function isActiveJobStatus(status) {
-  return status === "queued" || status === "running";
+function resolveForegroundWaitTimeoutMs(options = {}) {
+  const raw = options["wait-timeout-ms"] ?? process.env[FOREGROUND_WAIT_TIMEOUT_ENV];
+  if (raw === undefined || raw === null || String(raw).trim() === "") {
+    return DEFAULT_FOREGROUND_WAIT_TIMEOUT_MS;
+  }
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`Invalid wait timeout "${raw}". Use a non-negative number of milliseconds (0 waits forever).`);
+  }
+  return parsed;
 }
 
 function getCurrentClaudeSessionId() {
@@ -336,7 +362,7 @@ async function waitForSingleJobSnapshot(cwd, reference, options = {}) {
 async function resolveLatestTrackedTaskThread(cwd, options = {}) {
   const workspaceRoot = resolveWorkspaceRoot(cwd);
   const sessionId = getCurrentClaudeSessionId();
-  const jobs = sortJobsNewestFirst(listJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
+  const jobs = sortJobsNewestFirst(listReconciledJobs(workspaceRoot)).filter((job) => job.id !== options.excludeJobId);
   const visibleJobs = filterJobsForCurrentClaudeSession(jobs);
   const activeTask = visibleJobs.find((job) => job.jobClass === "task" && (job.status === "queued" || job.status === "running"));
   if (activeTask) {
@@ -655,22 +681,9 @@ function requireTaskRequest(prompt, resumeLast) {
   }
 }
 
-async function runForegroundCommand(job, runner, options = {}) {
-  const { logFile, progress } = createTrackedProgress(job, {
-    logFile: options.logFile,
-    stderr: !options.json
-  });
-  const execution = await runTrackedJob(job, () => runner(progress), { logFile });
-  outputResult(options.json ? execution.payload : execution.rendered, options.json);
-  if (execution.exitStatus !== 0) {
-    process.exitCode = execution.exitStatus;
-  }
-  return execution;
-}
-
-function spawnDetachedTaskWorker(cwd, jobId) {
+function spawnDetachedJobWorker(cwd, jobId) {
   const scriptPath = path.join(ROOT_DIR, "scripts", "codex-companion.mjs");
-  const child = spawn(process.execPath, [scriptPath, "task-worker", "--cwd", cwd, "--job-id", jobId], {
+  const child = spawn(process.execPath, [scriptPath, "job-worker", "--cwd", cwd, "--job-id", jobId], {
     cwd,
     env: process.env,
     detached: true,
@@ -681,21 +694,52 @@ function spawnDetachedTaskWorker(cwd, jobId) {
   return child;
 }
 
-function enqueueBackgroundTask(cwd, job, request) {
+/**
+ * Records the job as queued and starts a detached worker for it.
+ *
+ * Every Codex run, foreground or background, executes in a detached worker so
+ * that the lifetime of the Claude-side Bash call never decides whether the
+ * result gets recorded. The job file (including the request) is written before
+ * the worker starts so the worker can never race ahead of it.
+ */
+function enqueueBackgroundJob(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
-  const child = spawnDetachedTaskWorker(cwd, job.id);
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: null,
     logFile,
     request
   };
   writeJobFile(job.workspaceRoot, job.id, queuedRecord);
-  upsertJob(job.workspaceRoot, queuedRecord);
+  // The index never carries the request payload (prompts can be large); the
+  // worker reads it from the job file.
+  upsertJob(job.workspaceRoot, { ...queuedRecord, request: undefined });
+
+  const child = spawnDetachedJobWorker(cwd, job.id);
+  const pid = child.pid ?? null;
+  child.on("error", (error) => {
+    markJobFailedIfActive(
+      job.workspaceRoot,
+      job.id,
+      `Failed to start the background Codex worker: ${error instanceof Error ? error.message : String(error)}`
+    );
+  });
+  if (pid !== null) {
+    // Record the worker pid, but never touch a record the worker (or a
+    // cancel) has already moved on from.
+    withStateLock(job.workspaceRoot, () => {
+      const patched = patchJobFile(job.workspaceRoot, job.id, (existing) =>
+        isActiveJobStatus(existing.status) && existing.pid == null ? { pid } : {}
+      );
+      if (patched && patched.pid === pid && isActiveJobStatus(patched.status)) {
+        upsertJob(job.workspaceRoot, { id: job.id, pid });
+      }
+    });
+  }
 
   return {
     payload: {
@@ -705,13 +749,186 @@ function enqueueBackgroundTask(cwd, job, request) {
       summary: job.summary,
       logFile
     },
-    logFile
+    logFile,
+    pid
   };
+}
+
+function createLogTail(logFile, write) {
+  let offset = 0;
+  let pending = "";
+  let inBlock = false;
+  const decoder = new StringDecoder("utf8");
+
+  function emit(line) {
+    // Log blocks ("[ts] Final output" followed by free-form body lines) are
+    // not progress; skip them until the next timestamped progress line.
+    const match = /^\[(\d{4}-\d{2}-\d{2}T[^\]]+)\]\s?(.*)$/.exec(line);
+    if (!match) {
+      if (!inBlock && line.trim()) {
+        inBlock = true;
+      }
+      return;
+    }
+    const message = match[2].trim();
+    if (isProgressBlockTitle(message)) {
+      inBlock = true;
+      return;
+    }
+    inBlock = false;
+    if (!message || message === "Queued for background execution.") {
+      return;
+    }
+    write(`[codex] ${message}\n`);
+  }
+
+  return {
+    flush() {
+      if (!logFile) {
+        return;
+      }
+      let fd = null;
+      try {
+        const stats = fs.statSync(logFile);
+        if (stats.size <= offset) {
+          return;
+        }
+        const buffer = Buffer.alloc(stats.size - offset);
+        fd = fs.openSync(logFile, "r");
+        const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, offset);
+        offset += bytesRead;
+        pending += decoder.write(buffer.subarray(0, bytesRead));
+      } catch {
+        return;
+      } finally {
+        if (fd !== null) {
+          fs.closeSync(fd);
+        }
+      }
+
+      let newlineIndex = pending.indexOf("\n");
+      while (newlineIndex !== -1) {
+        emit(pending.slice(0, newlineIndex));
+        pending = pending.slice(newlineIndex + 1);
+        newlineIndex = pending.indexOf("\n");
+      }
+    }
+  };
+}
+
+/**
+ * Follows a job until it reaches a terminal state or the wait budget runs out.
+ * Progress lines are mirrored to stderr so the foreground experience matches a
+ * directly-run job. Liveness is reconciled on every poll, so a worker that dies
+ * ends the wait with a failed job instead of hanging.
+ */
+async function attachToJob(workspaceRoot, jobId, options = {}) {
+  const tail = options.stderr ? createLogTail(options.logFile, (text) => process.stderr.write(text)) : null;
+  const timeoutMs = options.timeoutMs ?? DEFAULT_FOREGROUND_WAIT_TIMEOUT_MS;
+  const deadline = timeoutMs > 0 ? Date.now() + timeoutMs : Number.POSITIVE_INFINITY;
+
+  for (;;) {
+    tail?.flush();
+    const snapshot = buildSingleJobSnapshot(workspaceRoot, jobId);
+    if (!isActiveJobStatus(snapshot.job.status)) {
+      tail?.flush();
+      let storedJob = readStoredJob(workspaceRoot, jobId);
+      for (let attempt = 0; storedJob === null && attempt < 5; attempt += 1) {
+        await sleep(50);
+        storedJob = readStoredJob(workspaceRoot, jobId);
+      }
+      return {
+        snapshot,
+        storedJob,
+        timedOut: false,
+        timeoutMs
+      };
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      return { snapshot, storedJob: null, timedOut: true, timeoutMs };
+    }
+    await sleep(Math.min(ATTACH_POLL_INTERVAL_MS, remaining));
+  }
+}
+
+function finishForegroundCommand(outcome, options = {}) {
+  const job = outcome.snapshot.job;
+
+  if (outcome.timedOut) {
+    const payload = {
+      jobId: job.id,
+      status: job.status,
+      phase: job.phase ?? null,
+      title: job.title ?? null,
+      summary: job.summary ?? null,
+      threadId: job.threadId ?? null,
+      elapsed: job.elapsed ?? null,
+      lastActivityAt: job.lastActivityAt ?? null,
+      possiblyStalled: Boolean(job.possiblyStalled),
+      waitTimedOut: true,
+      timeoutMs: outcome.timeoutMs,
+      logFile: job.logFile ?? null
+    };
+    outputCommandResult(payload, renderStillRunningNotice(job, { waited: formatDuration(outcome.timeoutMs) }), options.json);
+    return outcome;
+  }
+
+  const storedJob = outcome.storedJob ?? {};
+  const hasCapturedOutput = storedJob.result !== undefined || typeof storedJob.rendered === "string";
+  if (hasCapturedOutput && (job.status === "completed" || job.status === "failed")) {
+    outputResult(options.json ? storedJob.result ?? {} : storedJob.rendered ?? "", options.json);
+    if (job.status !== "completed") {
+      process.exitCode = Number.isInteger(storedJob.codexStatus) && storedJob.codexStatus !== 0 ? storedJob.codexStatus : 1;
+    }
+    return outcome;
+  }
+
+  if (job.status === "completed") {
+    // Completed but the stored payload is unavailable (should not happen):
+    // fall back to the generic result renderer rather than printing nothing.
+    outputCommandResult({ job, storedJob: outcome.storedJob ?? null }, renderStoredJobResult(job, outcome.storedJob ?? null), options.json);
+    return outcome;
+  }
+
+  const message =
+    storedJob.errorMessage ??
+    job.errorMessage ??
+    (job.status === "cancelled" ? `Codex job ${job.id} was cancelled.` : `Codex job ${job.id} ended with status ${job.status}.`);
+  throw new Error(message);
+}
+
+async function runForegroundCommand(cwd, job, request, options = {}) {
+  const launched = enqueueBackgroundJob(cwd, job, request);
+  if (!options.json) {
+    process.stderr.write(
+      `[codex] ${job.title} started as ${job.id}. If this command is interrupted, the job keeps running; check /codex:status ${job.id}.\n`
+    );
+  }
+  const outcome = await attachToJob(job.workspaceRoot, job.id, {
+    logFile: launched.logFile,
+    stderr: !options.json,
+    timeoutMs: options.waitTimeoutMs
+  });
+  return finishForegroundCommand(outcome, options);
+}
+
+function executeStoredRequest(request, progress) {
+  if (request.kind === "review") {
+    return executeReviewRun({
+      ...request,
+      onProgress: progress
+    });
+  }
+  return executeTaskRun({
+    ...request,
+    onProgress: progress
+  });
 }
 
 async function handleReviewCommand(argv, config) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["base", "scope", "model", "cwd"],
+    valueOptions: ["base", "scope", "model", "cwd", "wait-timeout-ms"],
     booleanOptions: ["json", "background", "wait"],
     aliasMap: {
       m: "model"
@@ -720,7 +937,10 @@ async function handleReviewCommand(argv, config) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
+  const waitTimeoutMs = resolveForegroundWaitTimeoutMs(options);
   const focusText = positionals.join(" ").trim();
+  ensureCodexAvailable(cwd);
+  ensureGitRepository(cwd);
   const target = resolveReviewTarget(cwd, {
     base: options.base,
     scope: options.scope
@@ -736,20 +956,17 @@ async function handleReviewCommand(argv, config) {
     jobClass: "review",
     summary: metadata.summary
   });
-  await runForegroundCommand(
-    job,
-    (progress) =>
-      executeReviewRun({
-        cwd,
-        base: options.base,
-        scope: options.scope,
-        model: options.model,
-        focusText,
-        reviewName: config.reviewName,
-        onProgress: progress
-      }),
-    { json: options.json }
-  );
+  const request = {
+    kind: "review",
+    cwd,
+    base: options.base ?? null,
+    scope: options.scope ?? null,
+    model: options.model ?? null,
+    focusText,
+    reviewName: config.reviewName,
+    jobId: job.id
+  };
+  await runForegroundCommand(cwd, job, request, { json: options.json, waitTimeoutMs });
 }
 
 async function handleReview(argv) {
@@ -761,7 +978,7 @@ async function handleReview(argv) {
 
 async function handleTask(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["model", "effort", "cwd", "prompt-file"],
+    valueOptions: ["model", "effort", "cwd", "prompt-file", "wait-timeout-ms"],
     booleanOptions: ["json", "write", "resume-last", "resume", "fresh", "background"],
     aliasMap: {
       m: "model"
@@ -770,6 +987,7 @@ async function handleTask(argv) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
+  const waitTimeoutMs = resolveForegroundWaitTimeoutMs(options);
   const model = normalizeRequestedModel(options.model);
   const effort = normalizeReasoningEffort(options.effort);
   const prompt = readTaskPrompt(cwd, options, positionals);
@@ -785,12 +1003,13 @@ async function handleTask(argv) {
     resumeLast
   });
 
-  if (options.background) {
-    ensureCodexAvailable(cwd);
-    requireTaskRequest(prompt, resumeLast);
+  ensureCodexAvailable(cwd);
+  requireTaskRequest(prompt, resumeLast);
 
-    const job = buildTaskJob(workspaceRoot, taskMetadata, write);
-    const request = buildTaskRequest({
+  const job = buildTaskJob(workspaceRoot, taskMetadata, write);
+  const request = {
+    kind: "task",
+    ...buildTaskRequest({
       cwd,
       model,
       effort,
@@ -798,28 +1017,16 @@ async function handleTask(argv) {
       write,
       resumeLast,
       jobId: job.id
-    });
-    const { payload } = enqueueBackgroundTask(cwd, job, request);
+    })
+  };
+
+  if (options.background) {
+    const { payload } = enqueueBackgroundJob(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
   }
 
-  const job = buildTaskJob(workspaceRoot, taskMetadata, write);
-  await runForegroundCommand(
-    job,
-    (progress) =>
-      executeTaskRun({
-        cwd,
-        model,
-        effort,
-        prompt,
-        write,
-        resumeLast,
-        jobId: job.id,
-        onProgress: progress
-      }),
-    { json: options.json }
-  );
+  await runForegroundCommand(cwd, job, request, { json: options.json, waitTimeoutMs });
 }
 
 async function handleTransfer(argv) {
@@ -835,25 +1042,34 @@ async function handleTransfer(argv) {
   outputCommandResult(payload, rendered, options.json);
 }
 
-async function handleTaskWorker(argv) {
+async function handleJobWorker(argv) {
   const { options } = parseCommandInput(argv, {
     valueOptions: ["cwd", "job-id"]
   });
 
-  if (!options["job-id"]) {
-    throw new Error("Missing required --job-id for task-worker.");
+  const jobId = options["job-id"];
+  if (!jobId) {
+    throw new Error("Missing required --job-id for job-worker.");
   }
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
-  const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
-  if (!storedJob) {
-    throw new Error(`No stored job found for ${options["job-id"]}.`);
-  }
 
-  const request = storedJob.request;
-  if (!request || typeof request !== "object") {
-    throw new Error(`Stored job ${options["job-id"]} is missing its task request payload.`);
+  let storedJob;
+  let request;
+  try {
+    storedJob = readStoredJob(workspaceRoot, jobId);
+    if (!storedJob) {
+      throw new Error(`No stored job found for ${jobId}.`);
+    }
+    request = storedJob.request;
+    if (!request || typeof request !== "object") {
+      throw new Error(`Stored job ${jobId} is missing its request payload.`);
+    }
+  } catch (error) {
+    // Record the failure so the job never sits in "queued" forever.
+    markJobFailedIfActive(workspaceRoot, jobId, error instanceof Error ? error.message : String(error));
+    throw error;
   }
 
   const { logFile, progress } = createTrackedProgress(
@@ -871,11 +1087,7 @@ async function handleTaskWorker(argv) {
       workspaceRoot,
       logFile
     },
-    () =>
-      executeTaskRun({
-        ...request,
-        onProgress: progress
-      }),
+    () => executeStoredRequest(request, progress),
     { logFile }
   );
 }
@@ -934,7 +1146,7 @@ function handleTaskResumeCandidate(argv) {
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
   const sessionId = getCurrentClaudeSessionId();
-  const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listJobs(workspaceRoot)));
+  const jobs = filterJobsForCurrentClaudeSession(sortJobsNewestFirst(listReconciledJobs(workspaceRoot)));
   const candidate = findLatestResumableTaskJob(jobs);
 
   const payload = {
@@ -973,6 +1185,17 @@ async function handleCancel(argv) {
   const threadId = existing.threadId ?? job.threadId ?? null;
   const turnId = existing.turnId ?? job.turnId ?? null;
 
+  // Record the cancellation first, atomically and only if the job is still
+  // active. A worker that finishes in the meantime keeps its result, and a
+  // worker that is then interrupted or killed sees "cancelled" and leaves it.
+  const cancelled = markJobCancelledIfActive(workspaceRoot, job.id);
+  if (!cancelled) {
+    const latest = buildSingleJobSnapshot(cwd, job.id).job;
+    throw new Error(
+      `Job ${job.id} already finished (${latest.status}) before it could be cancelled. Check /codex:result ${job.id}.`
+    );
+  }
+
   const interrupt = await interruptAppServerTurn(cwd, { threadId, turnId });
   if (interrupt.attempted) {
     appendLogLine(
@@ -984,31 +1207,15 @@ async function handleCancel(argv) {
   }
 
   terminateProcessTree(job.pid ?? Number.NaN);
-  appendLogLine(job.logFile, "Cancelled by user.");
 
-  const completedAt = nowIso();
   const nextJob = {
     ...job,
     status: "cancelled",
     phase: "cancelled",
     pid: null,
-    completedAt,
+    completedAt: nowIso(),
     errorMessage: "Cancelled by user."
   };
-
-  writeJobFile(workspaceRoot, job.id, {
-    ...existing,
-    ...nextJob,
-    cancelledAt: completedAt
-  });
-  upsertJob(workspaceRoot, {
-    id: job.id,
-    status: "cancelled",
-    phase: "cancelled",
-    pid: null,
-    errorMessage: "Cancelled by user.",
-    completedAt
-  });
 
   const payload = {
     jobId: job.id,
@@ -1046,8 +1253,9 @@ async function main() {
     case "transfer":
       await handleTransfer(argv);
       break;
+    case "job-worker":
     case "task-worker":
-      await handleTaskWorker(argv);
+      await handleJobWorker(argv);
       break;
     case "status":
       await handleStatus(argv);

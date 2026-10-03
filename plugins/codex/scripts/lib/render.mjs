@@ -106,17 +106,31 @@ function formatCodexResumeCommand(job) {
   return `codex resume ${job.threadId}`;
 }
 
+function formatLastActivity(job) {
+  if (!job.idle) {
+    return "";
+  }
+  return job.possiblyStalled ? `${job.idle} ago (possibly stalled)` : `${job.idle} ago`;
+}
+
+function buildStallWarning(job) {
+  if (!job.possiblyStalled) {
+    return null;
+  }
+  return `Warning: no Codex activity for ${job.idle}. The run may be stalled. Use /codex:cancel ${job.id} to stop it, or /codex:status ${job.id} --wait to keep waiting.`;
+}
+
 function appendActiveJobsTable(lines, jobs) {
   lines.push("Active jobs:");
-  lines.push("| Job | Kind | Status | Phase | Elapsed | Codex Session ID | Summary | Actions |");
-  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
+  lines.push("| Job | Kind | Status | Phase | Elapsed | Last Activity | Codex Session ID | Summary | Actions |");
+  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
   for (const job of jobs) {
     const actions = [`/codex:status ${job.id}`];
     if (job.status === "queued" || job.status === "running") {
       actions.push(`/codex:cancel ${job.id}`);
     }
     lines.push(
-      `| ${escapeMarkdownCell(job.id)} | ${escapeMarkdownCell(job.kindLabel)} | ${escapeMarkdownCell(job.status)} | ${escapeMarkdownCell(job.phase ?? "")} | ${escapeMarkdownCell(job.elapsed ?? "")} | ${escapeMarkdownCell(job.threadId ?? "")} | ${escapeMarkdownCell(job.summary ?? "")} | ${actions.map((action) => `\`${action}\``).join("<br>")} |`
+      `| ${escapeMarkdownCell(job.id)} | ${escapeMarkdownCell(job.kindLabel)} | ${escapeMarkdownCell(job.status)} | ${escapeMarkdownCell(job.phase ?? "")} | ${escapeMarkdownCell(job.elapsed ?? "")} | ${escapeMarkdownCell(formatLastActivity(job))} | ${escapeMarkdownCell(job.threadId ?? "")} | ${escapeMarkdownCell(job.summary ?? "")} | ${actions.map((action) => `\`${action}\``).join("<br>")} |`
     );
   }
 }
@@ -132,8 +146,18 @@ function pushJobDetails(lines, job, options = {}) {
   if (options.showElapsed && job.elapsed) {
     lines.push(`  Elapsed: ${job.elapsed}`);
   }
+  if (options.showElapsed && job.idle) {
+    lines.push(`  Last activity: ${formatLastActivity(job)}`);
+  }
   if (options.showDuration && job.duration) {
     lines.push(`  Duration: ${job.duration}`);
+  }
+  if (job.status === "failed" && job.errorMessage) {
+    lines.push(`  Error: ${String(job.errorMessage).replace(/\s*\r?\n\s*/g, " ").trim()}`);
+  }
+  const stallWarning = buildStallWarning(job);
+  if (stallWarning) {
+    lines.push(`  ${stallWarning}`);
   }
   if (job.threadId) {
     lines.push(`  Codex session ID: ${job.threadId}`);
@@ -146,6 +170,7 @@ function pushJobDetails(lines, job, options = {}) {
     lines.push(`  Log: ${job.logFile}`);
   }
   if ((job.status === "queued" || job.status === "running") && options.showCancelHint) {
+    lines.push(`  Wait: /codex:status ${job.id} --wait`);
     lines.push(`  Cancel: /codex:cancel ${job.id}`);
   }
   if (job.status !== "queued" && job.status !== "running" && options.showResultHint) {
@@ -442,6 +467,40 @@ export function renderStoredJobResult(job, storedJob) {
     lines.push("", "No captured result payload was stored for this job.");
   }
 
+  return `${lines.join("\n").trimEnd()}\n`;
+}
+
+export function renderStillRunningNotice(job, options = {}) {
+  const waited = options.waited ? ` after waiting ${options.waited}` : "";
+  const lines = [
+    `# ${job.title ?? "Codex Job"} still running`,
+    "",
+    `Job ${job.id} is still ${job.status}${waited}. It keeps running in the background; nothing was lost.`
+  ];
+  if (job.phase) {
+    lines.push(`Phase: ${job.phase}`);
+  }
+  if (job.elapsed) {
+    lines.push(`Elapsed: ${job.elapsed}`);
+  }
+  if (job.idle) {
+    lines.push(`Last activity: ${formatLastActivity(job)}`);
+  }
+  if (job.threadId) {
+    lines.push(`Codex session ID: ${job.threadId}`);
+  }
+  const stallWarning = buildStallWarning(job);
+  if (stallWarning) {
+    lines.push("", stallWarning);
+  }
+  lines.push(
+    "",
+    "Next steps:",
+    `- Keep waiting: /codex:status ${job.id} --wait`,
+    `- Check progress: /codex:status ${job.id}`,
+    `- Read the result once it finishes: /codex:result ${job.id}`,
+    `- Stop it: /codex:cancel ${job.id}`
+  );
   return `${lines.join("\n").trimEnd()}\n`;
 }
 

@@ -1,12 +1,19 @@
 import fs from "node:fs";
 
 import { getSessionRuntimeStatus } from "./codex.mjs";
-import { getConfig, listJobs, readJobFile, resolveJobFile } from "./state.mjs";
+import { describeActivity, listReconciledJobs } from "./liveness.mjs";
+import { getConfig, readJobFile, resolveJobFile } from "./state.mjs";
 import { SESSION_ID_ENV } from "./tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./workspace.mjs";
 
 export const DEFAULT_MAX_STATUS_JOBS = 8;
 export const DEFAULT_MAX_PROGRESS_LINES = 4;
+
+function listJobs(workspaceRoot, options = {}) {
+  // Always reconcile before reading: a job whose worker died must never be
+  // reported as still running.
+  return listReconciledJobs(workspaceRoot, options);
+}
 
 export function sortJobsNewestFirst(jobs) {
   return [...jobs].sort((left, right) => String(right.updatedAt ?? "").localeCompare(String(left.updatedAt ?? "")));
@@ -50,7 +57,7 @@ function stripLogPrefix(line) {
   return line.replace(/^\[[^\]]+\]\s*/, "").trim();
 }
 
-function isProgressBlockTitle(line) {
+export function isProgressBlockTitle(line) {
   return (
     ["Final output", "Assistant message", "Reasoning summary", "Review output"].includes(line) ||
     /^Subagent .+ message$/.test(line) ||
@@ -160,6 +167,9 @@ function inferLegacyJobPhase(job, progressPreview = []) {
 
 export function enrichJob(job, options = {}) {
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
+  const isActive = job.status === "queued" || job.status === "running";
+  const storedJob = isActive && options.workspaceRoot ? readStoredJob(options.workspaceRoot, job.id) : null;
+  const activity = isActive ? describeActivity(job, storedJob, options) : null;
   const enriched = {
     ...job,
     kindLabel: getJobTypeLabel(job),
@@ -171,7 +181,18 @@ export function enrichJob(job, options = {}) {
     duration:
       job.status === "completed" || job.status === "failed" || job.status === "cancelled"
         ? formatElapsedDuration(job.startedAt ?? job.createdAt, job.completedAt ?? job.updatedAt)
-        : null
+        : null,
+    ...(activity
+      ? {
+          lastActivityAt: activity.lastActivityAt,
+          idle: activity.idle,
+          idleMs: activity.idleMs,
+          heartbeatAt: activity.heartbeatAt,
+          workerPid: activity.workerPid,
+          workerAlive: activity.workerAlive,
+          possiblyStalled: activity.possiblyStalled
+        }
+      : {})
   };
 
   return {
@@ -185,7 +206,11 @@ export function readStoredJob(workspaceRoot, jobId) {
   if (!fs.existsSync(jobFile)) {
     return null;
   }
-  return readJobFile(jobFile);
+  try {
+    return readJobFile(jobFile);
+  } catch {
+    return null;
+  }
 }
 
 function matchJobReference(jobs, reference, predicate = () => true) {
@@ -217,16 +242,17 @@ export function buildStatusSnapshot(cwd, options = {}) {
   const maxJobs = options.maxJobs ?? DEFAULT_MAX_STATUS_JOBS;
   const maxProgressLines = options.maxProgressLines ?? DEFAULT_MAX_PROGRESS_LINES;
 
+  const enrichOptions = { maxProgressLines, workspaceRoot, env: options.env };
   const running = jobs
     .filter((job) => job.status === "queued" || job.status === "running")
-    .map((job) => enrichJob(job, { maxProgressLines }));
+    .map((job) => enrichJob(job, enrichOptions));
 
   const latestFinishedRaw = jobs.find((job) => job.status !== "queued" && job.status !== "running") ?? null;
-  const latestFinished = latestFinishedRaw ? enrichJob(latestFinishedRaw, { maxProgressLines }) : null;
+  const latestFinished = latestFinishedRaw ? enrichJob(latestFinishedRaw, enrichOptions) : null;
 
   const recent = (options.all ? jobs : jobs.slice(0, maxJobs))
     .filter((job) => job.status !== "queued" && job.status !== "running" && job.id !== latestFinished?.id)
-    .map((job) => enrichJob(job, { maxProgressLines }));
+    .map((job) => enrichJob(job, enrichOptions));
 
   return {
     workspaceRoot,
@@ -249,7 +275,7 @@ export function buildSingleJobSnapshot(cwd, reference, options = {}) {
 
   return {
     workspaceRoot,
-    job: enrichJob(selected, { maxProgressLines: options.maxProgressLines })
+    job: enrichJob(selected, { maxProgressLines: options.maxProgressLines, workspaceRoot, env: options.env })
   };
 }
 
@@ -284,7 +310,19 @@ export function resolveCancelableJob(cwd, reference, options = {}) {
   const activeJobs = jobs.filter((job) => job.status === "queued" || job.status === "running");
 
   if (reference) {
-    const selected = matchJobReference(activeJobs, reference);
+    let selected = null;
+    try {
+      selected = matchJobReference(activeJobs, reference);
+    } catch (error) {
+      // Explain a finished job instead of claiming it does not exist.
+      const known = jobs.find((job) => job.id === reference || job.id.startsWith(reference)) ?? null;
+      if (known && !(known.status === "queued" || known.status === "running")) {
+        throw new Error(
+          `Job ${known.id} is already ${known.status}; there is nothing to cancel. Check /codex:result ${known.id}.`
+        );
+      }
+      throw error;
+    }
     if (!selected) {
       throw new Error(`No active job found for "${reference}".`);
     }

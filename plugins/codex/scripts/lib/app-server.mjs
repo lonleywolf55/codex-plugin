@@ -21,6 +21,8 @@ const PLUGIN_MANIFEST = JSON.parse(fs.readFileSync(PLUGIN_MANIFEST_URL, "utf8"))
 
 export const BROKER_ENDPOINT_ENV = "CODEX_COMPANION_APP_SERVER_ENDPOINT";
 export const BROKER_BUSY_RPC_CODE = -32001;
+export const BROKER_APP_SERVER_EXITED_METHOD = "broker/appServerExited";
+export const BROKER_RELEASE_METHOD = "broker/release";
 
 /** @type {ClientInfo} */
 const DEFAULT_CLIENT_INFO = {
@@ -93,7 +95,12 @@ class AppServerClientBase {
 
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject, method });
-      this.sendMessage({ id, method, params });
+      try {
+        this.sendMessage({ id, method, params });
+      } catch (error) {
+        this.pending.delete(id);
+        reject(error);
+      }
     });
   }
 
@@ -130,6 +137,14 @@ class AppServerClientBase {
 
     if (message.id !== undefined && message.method) {
       this.handleServerRequest(message);
+      return;
+    }
+
+    if (message.method === BROKER_APP_SERVER_EXITED_METHOD) {
+      // The shared broker lost its codex app-server and is about to close this
+      // connection. Remember why so pending turns fail with a useful message.
+      const detail = message.params?.message ?? "The shared codex app-server exited.";
+      this.exitError = createProtocolError(detail, message.params);
       return;
     }
 
@@ -202,6 +217,10 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       this.stderr += chunk;
     });
 
+    // Writing to a process that already exited raises EPIPE asynchronously;
+    // without a listener that would crash the whole companion process.
+    this.proc.stdin.on("error", () => {});
+
     this.proc.on("error", (error) => {
       this.handleExit(error);
     });
@@ -271,6 +290,9 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
     if (!stdin) {
       throw new Error("codex app-server stdin is not available.");
     }
+    if (this.exitResolved || stdin.destroyed || stdin.writableEnded) {
+      throw this.exitError ?? createProtocolError("codex app-server is no longer running.");
+    }
     stdin.write(line);
   }
 }
@@ -317,6 +339,15 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
 
     this.closed = true;
     if (this.socket) {
+      // Tell the broker this is a deliberate disconnect so it does not treat
+      // the stream owner as having crashed (and interrupt the turn).
+      if (!this.exitResolved && !this.socket.destroyed && !this.socket.writableEnded) {
+        try {
+          this.socket.write(`${JSON.stringify({ method: BROKER_RELEASE_METHOD, params: {} })}\n`);
+        } catch {
+          // Best effort only.
+        }
+      }
       this.socket.end();
     }
     await this.exitPromise;
@@ -327,6 +358,9 @@ class BrokerCodexAppServerClient extends AppServerClientBase {
     const socket = this.socket;
     if (!socket) {
       throw new Error("codex app-server broker connection is not connected.");
+    }
+    if (this.exitResolved || socket.destroyed || socket.writableEnded) {
+      throw this.exitError ?? createProtocolError("codex app-server broker connection closed.");
     }
     socket.write(line);
   }

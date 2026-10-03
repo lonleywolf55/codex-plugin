@@ -1,9 +1,11 @@
 import fs from "node:fs";
 import process from "node:process";
 
-import { readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
+import { HEARTBEAT_INTERVAL_MS, markJobFailedIfActive } from "./liveness.mjs";
+import { patchJobFile, readJobFile, resolveJobFile, resolveJobLogFile, upsertJob, writeJobFile } from "./state.mjs";
 
 export const SESSION_ID_ENV = "CODEX_COMPANION_SESSION_ID";
+const ACTIVITY_WRITE_THROTTLE_MS = 1000;
 
 export function nowIso() {
   return new Date().toISOString();
@@ -71,6 +73,7 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
   let lastPhase = null;
   let lastThreadId = null;
   let lastTurnId = null;
+  let lastActivityWriteAt = 0;
 
   return (event) => {
     const normalized = normalizeProgressEvent(event);
@@ -95,22 +98,116 @@ export function createJobProgressUpdater(workspaceRoot, jobId) {
       changed = true;
     }
 
-    if (!changed) {
+    // Every progress event proves the Codex run is still producing output, so
+    // record it on the job file (throttled) even when nothing else changed.
+    // `/codex:status` uses this to flag runs that have gone quiet.
+    const now = Date.now();
+    const activityDue = now - lastActivityWriteAt >= ACTIVITY_WRITE_THROTTLE_MS;
+    if (!changed && !activityDue) {
       return;
     }
 
-    upsertJob(workspaceRoot, patch);
+    // Progress bookkeeping must never take the job down: a transient file
+    // error here (for example a share violation on Windows) is not a Codex
+    // failure, and an exception from a notification handler would be fatal.
+    try {
+      if (changed) {
+        upsertJob(workspaceRoot, patch);
+      }
 
-    const jobFile = resolveJobFile(workspaceRoot, jobId);
-    if (!fs.existsSync(jobFile)) {
-      return;
+      lastActivityWriteAt = now;
+      const { id: _ignored, ...filePatch } = patch;
+      patchJobFile(workspaceRoot, jobId, {
+        ...filePatch,
+        lastActivityAt: new Date(now).toISOString()
+      });
+    } catch {
+      // Retried implicitly by the next event or heartbeat.
     }
+  };
+}
 
-    const storedJob = readJobFile(jobFile);
-    writeJobFile(workspaceRoot, jobId, {
-      ...storedJob,
-      ...patch
-    });
+function registerWorkerGuards(job, options = {}) {
+  const workspaceRoot = job.workspaceRoot;
+  const jobId = job.id;
+  let active = true;
+
+  const failIfActive = (message) => {
+    if (!active) {
+      return false;
+    }
+    try {
+      return markJobFailedIfActive(workspaceRoot, jobId, message);
+    } catch {
+      return false;
+    }
+  };
+
+  const signalNames = process.platform === "win32" ? ["SIGINT", "SIGBREAK"] : ["SIGTERM", "SIGINT", "SIGHUP"];
+  const signalHandlers = new Map();
+  for (const signalName of signalNames) {
+    const handler = () => {
+      failIfActive(
+        `Codex job ${jobId} was interrupted by ${signalName} before Codex finished. The process running it was stopped (for example by a Claude Code Bash timeout, /codex:cancel, or the session ending).`
+      );
+      options.onSignal?.(signalName);
+      process.exit(128 + (signalName === "SIGINT" ? 2 : signalName === "SIGHUP" ? 1 : 15));
+    };
+    signalHandlers.set(signalName, handler);
+    try {
+      process.on(signalName, handler);
+    } catch {
+      // Some platforms reject some signals; ignore.
+    }
+  }
+
+  const onBeforeExit = () => {
+    // The event loop drained while the job was still active: the connection to
+    // Codex went away without anyone rejecting the pending turn. Never let the
+    // process exit 0 while the job record still says "running".
+    if (
+      failIfActive(
+        `Codex job ${jobId} lost its connection to the Codex app-server before the turn completed, so no result was recorded.`
+      )
+    ) {
+      process.exitCode = 1;
+    }
+  };
+  const onUncaught = (error) => {
+    const message = error instanceof Error ? error.message : String(error);
+    failIfActive(`Codex job ${jobId} crashed before Codex finished: ${message}`);
+    process.stderr.write(`${message}\n`);
+    process.exit(1);
+  };
+
+  process.on("beforeExit", onBeforeExit);
+  process.on("uncaughtException", onUncaught);
+  process.on("unhandledRejection", onUncaught);
+
+  let heartbeatTimer = null;
+  const writeHeartbeat = () => {
+    try {
+      patchJobFile(workspaceRoot, jobId, { heartbeatAt: nowIso() });
+    } catch {
+      // Heartbeats are advisory.
+    }
+  };
+  writeHeartbeat();
+  heartbeatTimer = setInterval(writeHeartbeat, options.heartbeatIntervalMs ?? HEARTBEAT_INTERVAL_MS);
+  heartbeatTimer.unref?.();
+
+  return () => {
+    active = false;
+    if (heartbeatTimer) {
+      clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+    }
+    for (const [signalName, handler] of signalHandlers) {
+      process.off(signalName, handler);
+    }
+    process.off("beforeExit", onBeforeExit);
+    process.off("uncaughtException", onUncaught);
+    process.off("unhandledRejection", onUncaught);
   };
 }
 
@@ -140,29 +237,48 @@ function readStoredJobOrNull(workspaceRoot, jobId) {
 }
 
 export async function runTrackedJob(job, runner, options = {}) {
+  const startedAt = nowIso();
   const runningRecord = {
     ...job,
     status: "running",
-    startedAt: nowIso(),
+    startedAt,
     phase: "starting",
     pid: process.pid,
+    lastActivityAt: startedAt,
+    heartbeatAt: startedAt,
     logFile: options.logFile ?? job.logFile ?? null
   };
   writeJobFile(job.workspaceRoot, job.id, runningRecord);
-  upsertJob(job.workspaceRoot, runningRecord);
+  // Keep request payloads and captured results out of the index.
+  const { request: _request, result: _result, rendered: _rendered, ...indexRecord } = runningRecord;
+  upsertJob(job.workspaceRoot, indexRecord);
+
+  const releaseGuards = registerWorkerGuards(runningRecord, options);
 
   try {
     const execution = await runner();
-    const completionStatus = execution.exitStatus === 0 ? "completed" : "failed";
     const completedAt = nowIso();
+    const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
+    // A user cancellation that raced with the final turn keeps its "cancelled"
+    // outcome; the captured output is still stored for `/codex:result`.
+    const wasCancelled = existing.status === "cancelled";
+    const completionStatus = wasCancelled ? "cancelled" : execution.exitStatus === 0 ? "completed" : "failed";
+    const completionPhase = wasCancelled ? "cancelled" : completionStatus === "completed" ? "done" : "failed";
     writeJobFile(job.workspaceRoot, job.id, {
       ...runningRecord,
+      ...(wasCancelled ? existing : {}),
+      ...(existing.lastActivityAt ? { lastActivityAt: existing.lastActivityAt } : {}),
       status: completionStatus,
       threadId: execution.threadId ?? null,
       turnId: execution.turnId ?? null,
       pid: null,
-      phase: completionStatus === "completed" ? "done" : "failed",
-      completedAt,
+      phase: completionPhase,
+      completedAt: wasCancelled ? existing.completedAt ?? completedAt : completedAt,
+      // Clear any failure recorded by an earlier false alarm (for example a
+      // stale heartbeat after the machine slept) now that the run finished.
+      errorMessage: wasCancelled ? existing.errorMessage ?? null : null,
+      summary: execution.summary ?? runningRecord.summary ?? null,
+      codexStatus: execution.exitStatus ?? null,
       result: execution.payload,
       rendered: execution.rendered
     });
@@ -172,16 +288,24 @@ export async function runTrackedJob(job, runner, options = {}) {
       threadId: execution.threadId ?? null,
       turnId: execution.turnId ?? null,
       summary: execution.summary,
-      phase: completionStatus === "completed" ? "done" : "failed",
+      phase: completionPhase,
       pid: null,
-      completedAt
+      errorMessage: wasCancelled ? existing.errorMessage ?? null : null,
+      completedAt: wasCancelled ? existing.completedAt ?? completedAt : completedAt
     });
+    releaseGuards();
     appendLogBlock(options.logFile ?? job.logFile ?? null, "Final output", execution.rendered);
     return execution;
   } catch (error) {
+    releaseGuards();
     const errorMessage = error instanceof Error ? error.message : String(error);
     const existing = readStoredJobOrNull(job.workspaceRoot, job.id) ?? runningRecord;
     const completedAt = nowIso();
+    if (existing.status === "cancelled") {
+      // `/codex:cancel` already recorded the outcome; keep it.
+      appendLogLine(options.logFile ?? job.logFile ?? existing.logFile ?? null, errorMessage);
+      throw error;
+    }
     writeJobFile(job.workspaceRoot, job.id, {
       ...existing,
       status: "failed",
@@ -199,6 +323,7 @@ export async function runTrackedJob(job, runner, options = {}) {
       errorMessage,
       completedAt
     });
+    appendLogLine(options.logFile ?? job.logFile ?? existing.logFile ?? null, `Failed: ${errorMessage}`);
     throw error;
   }
 }

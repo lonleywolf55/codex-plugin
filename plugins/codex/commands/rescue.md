@@ -38,8 +38,10 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task-resume-candidate -
 
 Operating rules:
 
-- The subagent is a thin forwarder only. It should use one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task ...` and return that command's stdout as-is.
+- The subagent is a thin forwarder only. It should use one `Bash` call (with `timeout: 600000`) to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task ...` and return that command's stdout as-is.
 - Return the Codex companion stdout verbatim to the user.
+- The Codex run itself executes in a detached worker, so a killed or timed-out `Bash` call never loses it. If the returned output says the task is "still running", present that notice verbatim: it contains the job id plus `/codex:status <job-id> --wait`, `/codex:result <job-id>`, and `/codex:cancel <job-id>`. Do not start a second Codex run for the same request.
+- If the subagent returns nothing because its `Bash` call was killed, tell the user the task is probably still running and that `/codex:status` will show it.
 - Do not paraphrase, summarize, rewrite, or add commentary before or after it.
 - Do not ask the subagent to inspect files, monitor progress, poll `/codex:status`, fetch `/codex:result`, call `/codex:cancel`, summarize output, or do follow-up work of its own.
 - Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort.

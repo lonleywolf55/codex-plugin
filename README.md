@@ -194,6 +194,10 @@ Use it to:
 - see the latest completed job
 - confirm whether a task is still running
 
+`/codex:status` verifies every active job against the machine before reporting it. A job whose worker process exited, crashed, or was killed (for example because the Claude session ended, the process tree was force-killed, or the machine restarted) is reported as `failed` with the reason instead of staying "running" forever. Active jobs also show a `Last Activity` age; a run that has been quiet for longer than the stall threshold (10 minutes by default, configurable with `CODEX_COMPANION_STALL_AFTER_MS`) is flagged as "possibly stalled" so you can decide whether to keep waiting or `/codex:cancel` it.
+
+`/codex:status <job-id> --wait` blocks until the job finishes or `--timeout-ms` elapses, and ends early if the job dies.
+
 ### `/codex:result`
 
 Shows the final stored Codex output for a finished job.
@@ -263,6 +267,17 @@ Then check in with:
 /codex:status
 /codex:result
 ```
+
+## How Jobs Run
+
+Every review and task runs in a detached worker process that the plugin starts on your machine. The command Claude invokes (`review`, `adversarial-review`, or `task`) only *follows* that worker: it mirrors progress, waits for the result, and prints it. This means the lifetime of Claude Code's `Bash` call never decides whether a Codex result gets recorded:
+
+- if the `Bash` call is killed or times out, the worker keeps going (on macOS and Linux; on Windows a forced process-tree kill can take the worker with it, in which case `/codex:status` reports the job as failed rather than leaving it "running") and `/codex:status` / `/codex:result` show the outcome once it finishes
+- a foreground command waits for up to `--wait-timeout-ms` (default 9.5 minutes, also settable with `CODEX_COMPANION_WAIT_TIMEOUT_MS`; `0` waits forever). When that budget runs out it prints a "still running" notice with the job id and the follow-up commands instead of being killed mid-wait
+- if the Codex app-server dies mid-run, the job is marked `failed` with the reason, and the shared runtime shuts down so the next command starts a fresh one instead of hanging
+- if a worker is killed outright, the next `/codex:status` notices that its process is gone and marks the job `failed`; a turn still running inside the shared runtime is interrupted so Codex does not keep working for nobody
+
+Job state is stored per workspace and written atomically under a cross-process lock, so concurrent jobs, `/codex:cancel`, and the stop hook do not corrupt the state file or silently drop each other's updates.
 
 ## Codex Integration
 

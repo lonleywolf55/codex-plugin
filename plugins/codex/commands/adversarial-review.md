@@ -45,7 +45,7 @@ Argument handling:
 - Unlike `/codex:review`, it can still take extra focus text after the flags.
 
 Foreground flow:
-- Run:
+- Run, passing `timeout: 600000` on the `Bash` call because reviews routinely take several minutes:
 ```bash
 node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" adversarial-review "$ARGUMENTS"
 ```
@@ -59,8 +59,15 @@ Background flow:
 Bash({
   command: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" adversarial-review "$ARGUMENTS"`,
   description: "Codex adversarial review",
-  run_in_background: true
+  run_in_background: true,
+  timeout: 600000
 })
 ```
 - Do not call `BashOutput` or wait for completion in this turn.
 - After launching the command, tell the user: "Codex adversarial review started in the background. Check `/codex:status` for progress."
+- When Claude Code later notifies you that the background command finished, present its stdout verbatim to the user. That stdout is the review.
+
+Job lifecycle rules (apply to both flows):
+- The review itself runs in a detached worker process. The `Bash` call only follows it, so a killed or timed-out `Bash` call never loses the review.
+- If the command output says the job is "still running" (the wait budget ran out), present that notice verbatim. It contains the job id and the follow-up commands; the user can continue with `/codex:status <job-id> --wait` and read the output with `/codex:result <job-id>`.
+- If the `Bash` call itself times out or is killed, do not re-run the review. Tell the user it is still running and point them to `/codex:status`.

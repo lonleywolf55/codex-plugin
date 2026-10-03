@@ -8,12 +8,16 @@ import { fileURLToPath } from "node:url";
 
 import { getCodexAvailability } from "./lib/codex.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
-import { getConfig, listJobs } from "./lib/state.mjs";
+import { getConfig } from "./lib/state.mjs";
 import { sortJobsNewestFirst } from "./lib/job-control.mjs";
+import { listReconciledJobs as listJobs } from "./lib/liveness.mjs";
 import { SESSION_ID_ENV } from "./lib/tracked-jobs.mjs";
 import { resolveWorkspaceRoot } from "./lib/workspace.mjs";
 
 const STOP_REVIEW_TIMEOUT_MS = 15 * 60 * 1000;
+// Let the companion hand back a "still running" payload before the hard
+// spawnSync timeout above kills it, so the job is never orphaned mid-wait.
+const STOP_REVIEW_WAIT_TIMEOUT_MS = 14 * 60 * 1000;
 const SCRIPT_DIR = path.dirname(fileURLToPath(import.meta.url));
 const ROOT_DIR = path.resolve(SCRIPT_DIR, "..");
 const STOP_REVIEW_TASK_MARKER = "Run a stop-gate review of the previous Claude turn.";
@@ -102,12 +106,16 @@ function runStopReview(cwd, input = {}) {
     ...process.env,
     ...(input.session_id ? { [SESSION_ID_ENV]: input.session_id } : {})
   };
-  const result = spawnSync(process.execPath, [scriptPath, "task", "--json", prompt], {
-    cwd,
-    env: childEnv,
-    encoding: "utf8",
-    timeout: STOP_REVIEW_TIMEOUT_MS
-  });
+  const result = spawnSync(
+    process.execPath,
+    [scriptPath, "task", "--json", "--wait-timeout-ms", String(STOP_REVIEW_WAIT_TIMEOUT_MS), prompt],
+    {
+      cwd,
+      env: childEnv,
+      encoding: "utf8",
+      timeout: STOP_REVIEW_TIMEOUT_MS
+    }
+  );
 
   if (result.error?.code === "ETIMEDOUT") {
     return {
@@ -129,6 +137,14 @@ function runStopReview(cwd, input = {}) {
 
   try {
     const payload = JSON.parse(result.stdout);
+    if (payload?.waitTimedOut) {
+      return {
+        ok: false,
+        reason: `The stop-time Codex review task ${payload.jobId} is still running after ${Math.round(
+          (payload.timeoutMs ?? STOP_REVIEW_WAIT_TIMEOUT_MS) / 60000
+        )} minutes. Check /codex:status ${payload.jobId} --wait, or bypass the gate.`
+      };
+    }
     return parseStopReviewOutput(payload?.rawOutput);
   } catch {
     return {
