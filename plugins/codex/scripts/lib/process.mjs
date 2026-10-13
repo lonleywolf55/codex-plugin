@@ -9,7 +9,7 @@ export function runCommand(command, args = [], options = {}) {
     input: options.input,
     maxBuffer: options.maxBuffer,
     stdio: options.stdio ?? "pipe",
-    shell: options.shell ?? (process.platform === "win32" ? (process.env.SHELL || true) : false),
+    shell: options.shell ?? (process.platform === "win32" ? process.env.SHELL || true : false),
     windowsHide: true
   });
 
@@ -52,6 +52,40 @@ export function binaryAvailable(command, versionArgs = ["--version"], options = 
 
 function looksLikeMissingProcessMessage(text) {
   return /not found|no running instance|cannot find|does not exist|no such process/i.test(text);
+}
+
+function normalizeProcessStartTime(value) {
+  return value.trim().split(/\s+/).slice(0, 5).join(" ");
+}
+
+export function readProcessStartTime(pid, options = {}) {
+  if ((options.platform ?? process.platform) === "win32") return null;
+  const result = (options.runCommandImpl ?? runCommand)("ps", ["-p", String(pid), "-o", "lstart="], { shell: false });
+  if (result.error || result.status !== 0 || !result.stdout.trim()) return null;
+  return normalizeProcessStartTime(result.stdout);
+}
+
+export function snapshotProcessTree(pid, options = {}) {
+  if ((options.platform ?? process.platform) === "win32") return null;
+  const run = options.runCommandImpl ?? runCommand;
+  const result = run("ps", ["-axo", "pid=,ppid=,lstart=,comm="], { shell: false });
+  if (result.error || result.status !== 0) throw new Error("Cannot inspect app-server descendants for cleanup.");
+  const rows = result.stdout.split("\n").flatMap((line) => {
+    const match = line.match(/^\s*(\d+)\s+(\d+)\s+(.+)$/);
+    return match ? [{ pid: Number(match[1]), parentPid: Number(match[2]), identity: match[3].trim() }] : [];
+  });
+  const descendants = rows.filter((entry) => entry.pid === pid);
+  if (
+    "expectedRootStartedAt" in options &&
+    (!options.expectedRootStartedAt ||
+      normalizeProcessStartTime(descendants[0]?.identity ?? "") !== options.expectedRootStartedAt)
+  ) {
+    return [];
+  }
+  for (let index = 0; index < descendants.length; index++) {
+    descendants.push(...rows.filter((entry) => entry.parentPid === descendants[index].pid));
+  }
+  return descendants.reverse();
 }
 
 export function terminateProcessTree(pid, options = {}) {
@@ -97,23 +131,35 @@ export function terminateProcessTree(pid, options = {}) {
     throw new Error(formatCommandFailure(result));
   }
 
+  if (options.snapshot) {
+    const results = options.snapshot.map((entry) => {
+      const current = runCommandImpl("ps", ["-p", String(entry.pid), "-o", "lstart=,comm="], { shell: false });
+      if (current.error || current.status !== 0 || current.stdout.trim() !== entry.identity) {
+        return { attempted: false, delivered: false, method: "identity-check" };
+      }
+      return terminateProcessTree(entry.pid, { ...options, snapshot: null });
+    });
+    return {
+      attempted: results.some((result) => result.attempted),
+      delivered: results.some((result) => result.delivered),
+      method: "descendant-snapshot"
+    };
+  }
+
+  const signal = options.signal ?? "SIGTERM";
   try {
-    killImpl(-pid, "SIGTERM");
+    killImpl(-pid, signal);
     return { attempted: true, delivered: true, method: "process-group" };
   } catch (error) {
-    if (error?.code !== "ESRCH") {
-      try {
-        killImpl(pid, "SIGTERM");
-        return { attempted: true, delivered: true, method: "process" };
-      } catch (innerError) {
-        if (innerError?.code === "ESRCH") {
-          return { attempted: true, delivered: false, method: "process" };
-        }
-        throw innerError;
+    try {
+      killImpl(pid, signal);
+      return { attempted: true, delivered: true, method: "process" };
+    } catch (innerError) {
+      if (innerError?.code === "ESRCH") {
+        return { attempted: true, delivered: false, method: "process" };
       }
+      throw innerError;
     }
-
-    return { attempted: true, delivered: false, method: "process-group" };
   }
 }
 
