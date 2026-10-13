@@ -103,3 +103,23 @@ test("process snapshot cleanup skips reused process identities", () => {
   });
   assert.deepEqual(calls, [[-10, "SIGTERM"]]);
 });
+
+test("snapshot cleanup refuses a root whose original identity has changed", () => {
+  const calls = [];
+  const snapshot = snapshotProcessTree(10, {
+    platform: "darwin",
+    expectedRootStartedAt: "Tue Oct 13 11:00:00 2026",
+    runCommandImpl() {
+      return { status: 0, stdout: "10 1 Tue Oct 13 12:00:00 2026 node\n20 10 Tue Oct 13 12:00:01 2026 child\n" };
+    }
+  });
+  terminateProcessTree(10, {
+    platform: "darwin",
+    snapshot,
+    killImpl(pid) {
+      calls.push(pid);
+    }
+  });
+  assert.deepEqual(snapshot, []);
+  assert.deepEqual(calls, []);
+});

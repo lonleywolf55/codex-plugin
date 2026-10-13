@@ -27,28 +27,40 @@ function alive(pid) {
     return false;
   }
 }
-async function startBroker(t, idleMs = 250, stubborn = false, detached = false) {
+async function startBroker(t, idleMs = 250, stubborn = false, detached = false, earlyExit = false, reparent = false) {
   const root = makeTempDir("cxc-idle-test-");
   const workspace = path.join(root, "workspace");
   const bin = path.join(root, "bin");
   fs.mkdirSync(workspace);
   fs.mkdirSync(bin);
   const childPids = path.join(root, "children.json");
+  const interruptState = path.join(root, "interrupt-state");
   writeExecutable(
     path.join(bin, "codex"),
     `#!/usr/bin/env node
 const fs = require("node:fs");
 const {spawn} = require("node:child_process");
-const descendant = spawn(process.execPath, ["-e", ${JSON.stringify(stubborn ? 'process.on("SIGTERM",()=>{});setInterval(() => {}, 1000)' : "setInterval(() => {}, 1000)")}], {stdio:"ignore",detached:${JSON.stringify(detached)}});
+const descendantSource = ${JSON.stringify(reparent ? `const {spawn}=require("node:child_process"); const child=spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{stdio:"ignore",detached:true});require("node:fs").writeFileSync(process.argv[1],JSON.stringify([Number(process.argv[2]),process.pid,child.pid]));setTimeout(()=>process.exit(0),500);` : stubborn ? 'process.on("SIGTERM",()=>{});setInterval(() => {}, 1000)' : "setInterval(() => {}, 1000)")};
+const descendant = spawn(process.execPath, ["-e", descendantSource, ${JSON.stringify(childPids)},String(process.pid)], {stdio:"ignore",detached:${JSON.stringify(detached)}});
 fs.writeFileSync(${JSON.stringify(childPids)}, JSON.stringify([process.pid, descendant.pid]));
 require("node:readline").createInterface({input:process.stdin}).on("line", line => {
   const m=JSON.parse(line);
   if (m.id === undefined) return;
+  if(m.method === "turn/interrupt") {
+    fs.writeFileSync(${JSON.stringify(interruptState)},"pending");
+    process.stdout.write(JSON.stringify({method:"turn/completed",params:{threadId:"long",turn:{id:"turn"}}})+"\\n");
+    setTimeout(()=>{
+      fs.writeFileSync(${JSON.stringify(interruptState)},"completed");
+      process.stdout.write(JSON.stringify({id:m.id,result:{}})+"\\n");
+    },1800);
+    return;
+  }
   if(m.method === "slow/request") {
     setTimeout(()=>process.stdout.write(JSON.stringify({id:m.id,result:{}})+"\\n"),700);
     return;
   }
   process.stdout.write(JSON.stringify({id:m.id,result:{}})+"\\n");
+  if(m.method==="initialize" && ${JSON.stringify(earlyExit)}) setTimeout(()=>process.exit(0),100);
   if(m.method==="turn/start") {
     process.stdout.write(JSON.stringify({method:"turn/started",params:{threadId:"long",turn:{id:"turn"}}})+"\\n");
     setTimeout(()=>process.stdout.write(JSON.stringify({method:"turn/completed",params:{threadId:"long",turn:{id:"turn"}}})+"\\n"),700);
@@ -69,7 +81,7 @@ require("node:readline").createInterface({input:process.stdin}).on("line", line 
       env: {
         ...process.env,
         PATH: `${bin}:${process.env.PATH}`,
-          CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS: String(idleMs)
+        CODEX_COMPANION_BROKER_IDLE_TIMEOUT_MS: String(idleMs)
       }
     }
   );
@@ -91,13 +103,14 @@ require("node:readline").createInterface({input:process.stdin}).on("line", line 
     fs.rmSync(root, { recursive: true, force: true });
   });
   await waitFor(() => fs.existsSync(endpoint));
+  if (reparent) await waitFor(() => JSON.parse(fs.readFileSync(childPids)).length === 3);
   const pids = JSON.parse(fs.readFileSync(childPids));
   const brokerStateFile = path.join(path.dirname(stateFile), "broker.json");
   fs.mkdirSync(path.dirname(stateFile), { recursive: true });
   fs.writeFileSync(brokerStateFile, JSON.stringify({ pid: broker.pid, endpoint: `unix:${endpoint}` }));
   function jobs(status) {
     fs.mkdirSync(path.dirname(stateFile), { recursive: true });
-    fs.writeFileSync(stateFile, JSON.stringify({ jobs: [{ status }] }));
+    fs.writeFileSync(stateFile, JSON.stringify({ jobs: [{ id: "job", status }] }));
   }
   async function connect() {
     const socket = net.createConnection(endpoint);
@@ -123,6 +136,7 @@ require("node:readline").createInterface({input:process.stdin}).on("line", line 
     pids,
     stateFile,
     brokerStateFile,
+    interruptState,
     jobs,
     connect,
     stopped
@@ -251,5 +265,68 @@ test(
     fs.writeFileSync(b.brokerStateFile, JSON.stringify({ pid: 999999, endpoint: "unix:/replacement.sock" }));
     await b.stopped();
     assert.equal(JSON.parse(fs.readFileSync(b.brokerStateFile)).pid, 999999);
+  }
+);
+
+for (const job of [
+  {},
+  { id: "job", status: "unknown" },
+  { id: "job", status: null },
+  { status: "completed" },
+  null,
+  [],
+  "completed"
+]) {
+  test(`broker protects malformed job ${JSON.stringify(job)}`, { skip: process.platform === "win32" }, async (t) => {
+    const b = await startBroker(t);
+    fs.mkdirSync(path.dirname(b.stateFile), { recursive: true });
+    fs.writeFileSync(b.stateFile, JSON.stringify({ jobs: [job] }));
+    await delay(600);
+    assert.ok(alive(b.broker.pid));
+    b.jobs("completed");
+    await b.stopped();
+  });
+}
+test(
+  "idle shutdown cleans known children after the original app-server exited",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const b = await startBroker(t, 400, false, true, true);
+    await b.stopped();
+  }
+);
+
+test(
+  "idle shutdown retains an observed detached grandchild after its intermediate parent exits",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const b = await startBroker(t, 1200, false, false, false, true);
+    await waitFor(() => !alive(b.pids[1]));
+    assert.ok(alive(b.pids[2]));
+    await b.stopped();
+  }
+);
+test(
+  "broker protects an interrupt request after its stream completes and clients disconnect",
+  { skip: process.platform === "win32" },
+  async (t) => {
+    const b = await startBroker(t);
+    const primary = await b.connect();
+    primary.write(JSON.stringify({ id: 1, method: "turn/start", params: { threadId: "long" } }) + "\n");
+    await once(primary, "data");
+    await delay(30);
+    const interrupt = await b.connect();
+    interrupt.write(
+      JSON.stringify({ id: 2, method: "turn/interrupt", params: { threadId: "long", turnId: "turn" } }) + "\n"
+    );
+    await delay(30);
+    primary.destroy();
+    interrupt.destroy();
+    await delay(1000);
+    assert.equal(fs.readFileSync(b.interruptState, "utf8"), "pending");
+    assert.ok(alive(b.broker.pid));
+    assert.ok(alive(b.pids[0]));
+    await b.stopped();
+    assert.equal(fs.readFileSync(b.interruptState, "utf8"), "completed");
   }
 );

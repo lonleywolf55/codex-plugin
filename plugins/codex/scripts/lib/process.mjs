@@ -9,7 +9,7 @@ export function runCommand(command, args = [], options = {}) {
     input: options.input,
     maxBuffer: options.maxBuffer,
     stdio: options.stdio ?? "pipe",
-    shell: options.shell ?? (process.platform === "win32" ? (process.env.SHELL || true) : false),
+    shell: options.shell ?? (process.platform === "win32" ? process.env.SHELL || true : false),
     windowsHide: true
   });
 
@@ -54,6 +54,17 @@ function looksLikeMissingProcessMessage(text) {
   return /not found|no running instance|cannot find|does not exist|no such process/i.test(text);
 }
 
+function normalizeProcessStartTime(value) {
+  return value.trim().split(/\s+/).slice(0, 5).join(" ");
+}
+
+export function readProcessStartTime(pid, options = {}) {
+  if ((options.platform ?? process.platform) === "win32") return null;
+  const result = (options.runCommandImpl ?? runCommand)("ps", ["-p", String(pid), "-o", "lstart="], { shell: false });
+  if (result.error || result.status !== 0 || !result.stdout.trim()) return null;
+  return normalizeProcessStartTime(result.stdout);
+}
+
 export function snapshotProcessTree(pid, options = {}) {
   if ((options.platform ?? process.platform) === "win32") return null;
   const run = options.runCommandImpl ?? runCommand;
@@ -64,6 +75,13 @@ export function snapshotProcessTree(pid, options = {}) {
     return match ? [{ pid: Number(match[1]), parentPid: Number(match[2]), identity: match[3].trim() }] : [];
   });
   const descendants = rows.filter((entry) => entry.pid === pid);
+  if (
+    "expectedRootStartedAt" in options &&
+    (!options.expectedRootStartedAt ||
+      normalizeProcessStartTime(descendants[0]?.identity ?? "") !== options.expectedRootStartedAt)
+  ) {
+    return [];
+  }
   for (let index = 0; index < descendants.length; index++) {
     descendants.push(...rows.filter((entry) => entry.parentPid === descendants[index].pid));
   }

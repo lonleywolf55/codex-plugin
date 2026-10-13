@@ -85,12 +85,33 @@ async function main() {
   let pendingRequests = 0;
   let idleSince = Date.now();
   let shutdownPromise = null;
+  const appServerPid = appClient.proc.pid;
+  const snapshotOptions = { expectedRootStartedAt: appClient.processStartedAt };
+  let appServerSnapshot = snapshotProcessTree(appServerPid, snapshotOptions);
+
+  function rememberDescendants(current) {
+    if (!current) return appServerSnapshot;
+    const owned = new Map((appServerSnapshot ?? []).map((entry) => [`${entry.pid}:${entry.identity}`, entry]));
+    for (const entry of current) owned.set(`${entry.pid}:${entry.identity}`, entry);
+    appServerSnapshot = [...owned.values()].sort(
+      (left, right) => Number(left.pid === appServerPid) - Number(right.pid === appServerPid)
+    );
+    return appServerSnapshot;
+  }
 
   function hasActiveJobs() {
     try {
       const state = JSON.parse(fs.readFileSync(stateFile, "utf8"));
       if (!Array.isArray(state.jobs)) return true;
-      return state.jobs.some((job) => job.status === "queued" || job.status === "running");
+      return state.jobs.some(
+        (job) =>
+          !job ||
+          typeof job !== "object" ||
+          Array.isArray(job) ||
+          typeof job.id !== "string" ||
+          !job.id.trim() ||
+          !["completed", "failed", "cancelled"].includes(job.status)
+      );
     } catch (error) {
       return error.code !== "ENOENT";
     }
@@ -133,13 +154,22 @@ async function main() {
       clearInterval(idleTimer);
       const serverClosed = new Promise((resolve) => server.close(resolve));
       for (const socket of sockets) socket.destroy();
-      const appServerPid = appClient.proc.pid;
-      const snapshot = snapshotProcessTree(appServerPid);
-      terminateProcessTree(appServerPid, { snapshot });
-      const forceTimer = setTimeout(() => terminateProcessTree(appServerPid, { signal: "SIGKILL", snapshot }), 1000);
+      const exited = appClient.proc.exitCode !== null || appClient.proc.signalCode !== null;
+      const currentSnapshot = exited ? [] : snapshotProcessTree(appServerPid, snapshotOptions);
+      const snapshot = rememberDescendants(currentSnapshot);
+      const stop = (signal = "SIGTERM") => {
+        if (process.platform === "win32" && exited) return;
+        terminateProcessTree(appServerPid, { signal, snapshot });
+      };
+      stop();
+      const forceTimer = setTimeout(() => stop("SIGKILL"), 1000);
       // Preserve child identities across reparenting when the app-server exits first.
-      await Promise.race([appClient.close().catch(() => {}), new Promise((resolve) => setTimeout(resolve, 1100))]);
-      terminateProcessTree(appServerPid, { signal: "SIGKILL", snapshot });
+      const close =
+        !exited && (process.platform === "win32" || currentSnapshot.some((entry) => entry.pid === appServerPid))
+          ? appClient.close().catch(() => {})
+          : Promise.resolve();
+      await Promise.race([close, new Promise((resolve) => setTimeout(resolve, 1100))]);
+      stop("SIGKILL");
       clearTimeout(forceTimer);
       await serverClosed;
       if (listenTarget.kind === "unix" && fs.existsSync(listenTarget.path)) fs.unlinkSync(listenTarget.path);
@@ -225,6 +255,7 @@ async function main() {
         }
 
         if (allowInterruptDuringActiveStream) {
+          pendingRequests++;
           try {
             const result = await appClient.request(message.method, message.params ?? {});
             send(socket, { id: message.id, result });
@@ -233,6 +264,8 @@ async function main() {
               id: message.id,
               error: buildJsonRpcError(error.rpcCode ?? -32000, error.message)
             });
+          } finally {
+            pendingRequests--;
           }
           continue;
         }
@@ -283,6 +316,10 @@ async function main() {
 
   const idleTimer = setInterval(
     () => {
+      if (appClient.proc.exitCode === null && appClient.proc.signalCode === null) {
+        const current = snapshotProcessTree(appServerPid, snapshotOptions);
+        rememberDescendants(current);
+      }
       if (sockets.size || pendingRequests || runningTurns.size || hasActiveJobs()) {
         idleSince = Date.now();
         return;
