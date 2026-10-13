@@ -192,7 +192,8 @@ class SpawnedCodexAppServerClient extends AppServerClientBase {
       env: this.options.env ?? process.env,
       stdio: ["pipe", "pipe", "pipe"],
       shell: process.platform === "win32" ? (process.env.SHELL || true) : false,
-      windowsHide: true
+      windowsHide: true,
+      detached: this.options.detached === true
     });
 
     this.proc.stdout.setEncoding("utf8");
