@@ -233,6 +233,12 @@ function structuredReviewPayload(prompt) {
 }
 
 function taskPayload(prompt, resume) {
+  if (BEHAVIOR === "empty-final-task") {
+    return "";
+  }
+  if (BEHAVIOR === "long-final-task") {
+    return "REPORT_START\\n" + "漢字🦄".repeat(700) + "\\n" + "line with emoji 🦄 and escapes \\"\\n".repeat(1200) + "REPORT_END";
+  }
   if (prompt.includes("<task>") && prompt.includes("Only review the work from the previous Claude turn.")) {
     if (BEHAVIOR === "adversarial-clean") {
       return "ALLOW: No blocking issues found in the previous turn.";
@@ -453,6 +459,12 @@ rl.on("line", (line) => {
 	        };
 	        saveState(state);
 	        send({ id: message.id, result: { turn: buildTurn(turnId) } });
+        if (BEHAVIOR === "failed-task") {
+          send({ method: "turn/started", params: { threadId: thread.id, turn: buildTurn(turnId) } });
+          send({ method: "turn/completed", params: { threadId: thread.id, turn: buildTurn(turnId, "failed", { message: "Intentional task failure", codexErrorInfo: null, additionalDetails: null }) } });
+          break;
+        }
+
 
         const payload = message.params.outputSchema && message.params.outputSchema.properties && message.params.outputSchema.properties.verdict
           ? structuredReviewPayload(prompt)

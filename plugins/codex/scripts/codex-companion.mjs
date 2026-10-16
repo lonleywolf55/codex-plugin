@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
@@ -81,8 +82,8 @@ function printUsage() {
       "  node scripts/codex-companion.mjs adversarial-review [--wait|--background] [--base <ref>] [--scope <auto|working-tree|branch>] [focus text]",
       "  node scripts/codex-companion.mjs task [--background] [--write] [--resume-last|--resume|--fresh] [--model <model|spark>] [--effort <none|minimal|low|medium|high|xhigh>] [prompt]",
       "  node scripts/codex-companion.mjs transfer [--source <claude-jsonl>] [--json]",
-      "  node scripts/codex-companion.mjs status [job-id] [--all] [--json]",
-      "  node scripts/codex-companion.mjs result [job-id] [--json]",
+      "  node scripts/codex-companion.mjs status [job-id] [--all] [--brief] [--json]",
+      "  node scripts/codex-companion.mjs result [job-id] [--final --offset <n>] [--json]",
       "  node scripts/codex-companion.mjs cancel [job-id] [--json]"
     ].join("\n")
   );
@@ -495,7 +496,7 @@ async function executeTaskRun(request) {
   });
 
   const rawOutput = typeof result.finalMessage === "string" ? result.finalMessage : "";
-  const failureMessage = result.error?.message ?? result.stderr ?? "";
+  const failureMessage = result.error?.message ?? result.turn?.error?.message ?? result.stderr ?? "";
   const rendered = renderTaskResult(
     {
       rawOutput,
@@ -518,6 +519,7 @@ async function executeTaskRun(request) {
 
   return {
     exitStatus: result.status,
+    errorMessage: result.status === 0 ? null : failureMessage || "Codex task failed without an error message.",
     threadId: result.threadId,
     turnId: result.turnId,
     payload,
@@ -674,28 +676,63 @@ function spawnDetachedTaskWorker(cwd, jobId) {
     cwd,
     env: process.env,
     detached: true,
-    stdio: "ignore",
+    stdio: ["pipe", "ignore", "ignore"],
     windowsHide: true
   });
-  child.unref();
   return child;
 }
 
-function enqueueBackgroundTask(cwd, job, request) {
+async function enqueueBackgroundTask(cwd, job, request) {
   const { logFile } = createTrackedProgress(job);
   appendLogLine(logFile, "Queued for background execution.");
 
   const child = spawnDetachedTaskWorker(cwd, job.id);
+  let pipeError = null;
+  child.stdin.on("error", (error) => {
+    pipeError = error;
+  });
   const queuedRecord = {
     ...job,
     status: "queued",
     phase: "queued",
-    pid: child.pid ?? null,
+    pid: child.pid,
     logFile,
     request
   };
-  writeJobFile(job.workspaceRoot, job.id, queuedRecord);
-  upsertJob(job.workspaceRoot, queuedRecord);
+  try {
+    await once(child, "spawn");
+    writeJobFile(job.workspaceRoot, job.id, queuedRecord);
+    upsertJob(job.workspaceRoot, queuedRecord);
+    if (pipeError) {
+      throw pipeError;
+    }
+    await new Promise((resolve, reject) => {
+      child.stdin.end("start\n", (error) => (error ? reject(error) : resolve()));
+    });
+    child.unref();
+  } catch (error) {
+    child.stdin.destroy();
+    terminateProcessTree(child.pid ?? Number.NaN);
+    let detail = error.message;
+    try {
+      const storedJob = readStoredJob(job.workspaceRoot, job.id);
+      if (storedJob?.status === "queued") {
+        const failedJob = {
+          ...storedJob,
+          status: "failed",
+          phase: "failed",
+          pid: null,
+          completedAt: nowIso(),
+          errorMessage: detail
+        };
+        writeJobFile(job.workspaceRoot, job.id, failedJob);
+        upsertJob(job.workspaceRoot, failedJob);
+      }
+    } catch (cleanupError) {
+      detail += `; could not record failed status: ${cleanupError.message}`;
+    }
+    throw new Error(`Background job ${job.id} failed to start: ${detail}`, { cause: error });
+  }
 
   return {
     payload: {
@@ -799,7 +836,7 @@ async function handleTask(argv) {
       resumeLast,
       jobId: job.id
     });
-    const { payload } = enqueueBackgroundTask(cwd, job, request);
+    const { payload } = await enqueueBackgroundTask(cwd, job, request);
     outputCommandResult(payload, renderQueuedTaskLaunch(payload), options.json);
     return;
   }
@@ -846,9 +883,22 @@ async function handleTaskWorker(argv) {
 
   const cwd = resolveCommandCwd(options);
   const workspaceRoot = resolveCommandWorkspace(options);
+  let release = "";
+  for await (const chunk of process.stdin) {
+    release += chunk;
+    if (release.length > 6) {
+      return;
+    }
+  }
+  if (release !== "start\n") {
+    return;
+  }
   const storedJob = readStoredJob(workspaceRoot, options["job-id"]);
   if (!storedJob) {
     throw new Error(`No stored job found for ${options["job-id"]}.`);
+  }
+  if (storedJob.status !== "queued") {
+    return;
   }
 
   const request = storedJob.request;
@@ -883,7 +933,7 @@ async function handleTaskWorker(argv) {
 async function handleStatus(argv) {
   const { options, positionals } = parseCommandInput(argv, {
     valueOptions: ["cwd", "timeout-ms", "poll-interval-ms"],
-    booleanOptions: ["json", "all", "wait"]
+    booleanOptions: ["json", "all", "wait", "brief"]
   });
 
   const cwd = resolveCommandCwd(options);
@@ -895,12 +945,25 @@ async function handleStatus(argv) {
           pollIntervalMs: options["poll-interval-ms"]
         })
       : buildSingleJobSnapshot(cwd, reference);
-    outputCommandResult(snapshot, renderJobStatusReport(snapshot.job), options.json);
+    const payload = options.brief
+      ? {
+          job: { id: snapshot.job.id, status: snapshot.job.status, errorMessage: snapshot.job.errorMessage ?? null },
+          waitTimedOut: snapshot.waitTimedOut ?? false
+        }
+      : snapshot;
+    outputCommandResult(
+      payload,
+      options.brief ? `${snapshot.job.id}: ${snapshot.job.status}\n` : renderJobStatusReport(snapshot.job),
+      options.json
+    );
     return;
   }
 
   if (options.wait) {
     throw new Error("`status --wait` requires a job id.");
+  }
+  if (options.brief) {
+    throw new Error("`status --brief` requires a job id.");
   }
 
   const report = buildStatusSnapshot(cwd, { all: options.all });
@@ -909,14 +972,53 @@ async function handleStatus(argv) {
 
 function handleResult(argv) {
   const { options, positionals } = parseCommandInput(argv, {
-    valueOptions: ["cwd"],
-    booleanOptions: ["json"]
+    valueOptions: ["cwd", "offset"],
+    booleanOptions: ["json", "final"]
   });
 
   const cwd = resolveCommandCwd(options);
   const reference = positionals[0] ?? "";
   const { workspaceRoot, job } = resolveResultJob(cwd, reference);
   const storedJob = readStoredJob(workspaceRoot, job.id);
+  if (options.final) {
+    if (!reference || reference !== job.id) {
+      throw new Error("`result --final` requires an exact job id.");
+    }
+    if (job.status !== "completed") {
+      throw new Error(`Job ${job.id} is ${job.status}: ${storedJob?.errorMessage ?? "no completed final report"}.`);
+    }
+    const rawOutput = storedJob?.result?.rawOutput;
+    if (typeof rawOutput !== "string" || !rawOutput.trim()) {
+      throw new Error(`Job ${job.id} completed without a final report.`);
+    }
+    const offset = Number(options.offset ?? 0);
+    if (!/^\d+$/.test(String(options.offset ?? 0)) || !Number.isSafeInteger(offset) || offset > rawOutput.length) {
+      throw new Error("--offset must be an integer within the final report.");
+    }
+    let end = Math.min(offset + 2000, rawOutput.length);
+    if (end < rawOutput.length && /[\uD800-\uDBFF]/.test(rawOutput[end - 1])) {
+      end -= 1;
+    }
+    const page = {
+      jobId: job.id,
+      offset,
+      nextOffset: end,
+      totalLength: rawOutput.length,
+      done: end === rawOutput.length,
+      text: rawOutput.slice(offset, end)
+    };
+    while (Buffer.byteLength(JSON.stringify(page, null, 2)) > 3500) {
+      end -= rawOutput.codePointAt(end - 2) > 0xffff ? 2 : 1;
+      page.nextOffset = end;
+      page.done = false;
+      page.text = rawOutput.slice(offset, end);
+    }
+    outputCommandResult(page, page.text, options.json);
+    return;
+  }
+  if (options.offset !== undefined) {
+    throw new Error("--offset requires --final.");
+  }
   const payload = {
     job,
     storedJob

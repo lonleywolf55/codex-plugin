@@ -3,12 +3,13 @@ import path from "node:path";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 import { fileURLToPath } from "node:url";
 
 import { buildEnv, installFakeCodex } from "./fake-codex-fixture.mjs";
 import { initGitRepo, makeTempDir, run } from "./helpers.mjs";
 import { loadBrokerSession, saveBrokerSession } from "../plugins/codex/scripts/lib/broker-lifecycle.mjs";
-import { resolveStateDir } from "../plugins/codex/scripts/lib/state.mjs";
+import { resolveStateDir, upsertJob, writeJobFile } from "../plugins/codex/scripts/lib/state.mjs";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const PLUGIN_ROOT = path.join(ROOT, "plugins", "codex");
@@ -2256,4 +2257,180 @@ test("setup and status honor --cwd when reading shared session runtime", () => {
   const payload = JSON.parse(setup.stdout);
   assert.equal(payload.sessionRuntime.mode, "shared");
   assert.equal(payload.sessionRuntime.endpoint, "unix:/tmp/fake-broker.sock");
+});
+
+
+test("background wait timeout continues the same task through final delivery", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "slow-task");
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+  const launched = run("node", [SCRIPT, "task", "--cwd", repo, "--background", "--json", "check the regression " + "context ".repeat(3000)], { cwd: ROOT, env });
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+  const timed = run("node", [SCRIPT, "status", jobId, "--cwd", repo, "--wait", "--timeout-ms", "1", "--brief", "--json"], { cwd: ROOT, env });
+  assert.equal(timed.status, 0, timed.stderr);
+  assert.equal(JSON.parse(timed.stdout).waitTimedOut, true);
+  assert.ok(Buffer.byteLength(timed.stdout) < 500);
+  assert.doesNotMatch(timed.stdout, /context context|progressPreview|request/);
+  const waited = run("node", [SCRIPT, "status", jobId, "--cwd", repo, "--wait", "--timeout-ms", "15000", "--brief", "--json"], { cwd: ROOT, env });
+  assert.equal(waited.status, 0, waited.stderr);
+  assert.equal(JSON.parse(waited.stdout).job.status, "completed");
+  const final = run("node", [SCRIPT, "result", jobId, "--cwd", repo, "--final", "--offset", "0", "--json"], { cwd: ROOT, env });
+  assert.equal(final.status, 0, final.stderr);
+  const page = JSON.parse(final.stdout);
+  assert.equal(page.jobId, jobId);
+  assert.equal(page.done, true);
+  assert.equal(page.text, "Handled the requested task.\nTask prompt accepted.");
+  const state = JSON.parse(fs.readFileSync(path.join(binDir, "fake-codex-state.json"), "utf8"));
+  assert.equal(state.threads.length, 1);
+});
+
+test("an immediately completed background task delivers every bounded final-report slice", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  const dataDir = makeTempDir();
+  installFakeCodex(binDir, "long-final-task");
+  initGitRepo(repo);
+  const env = { ...buildEnv(binDir), CLAUDE_PLUGIN_DATA: dataDir };
+  const launched = run("node", [SCRIPT, "task", "--cwd", repo, "--background", "--json", "review the change"], { cwd: ROOT, env });
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+  const waited = run("node", [SCRIPT, "status", jobId, "--cwd", repo, "--wait", "--timeout-ms", "15000", "--json"], { cwd: ROOT, env });
+  assert.equal(waited.status, 0, waited.stderr);
+  assert.equal(JSON.parse(waited.stdout).job.status, "completed");
+  let report = "";
+  let offset = 0;
+  let pages = 0;
+  while (true) {
+    const result = run("node", [SCRIPT, "result", jobId, "--cwd", repo, "--final", "--offset", String(offset), "--json"], { cwd: ROOT, env });
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(Buffer.byteLength(result.stdout) <= 3501);
+    const page = JSON.parse(result.stdout);
+    assert.equal(page.jobId, jobId);
+    assert.equal(page.offset, offset);
+    assert.equal(page.nextOffset, offset + page.text.length);
+    assert.doesNotMatch(page.text, /^[\uDC00-\uDFFF]|[\uD800-\uDBFF]$/);
+    assert.ok(page.nextOffset > offset);
+    report += page.text;
+    offset = page.nextOffset;
+    pages += 1;
+    if (page.done) {
+      assert.equal(offset, page.totalLength);
+      break;
+    }
+  }
+  assert.ok(pages > 2);
+  assert.equal(report, "REPORT_START\n" + "漢字🦄".repeat(700) + "\n" + 'line with emoji 🦄 and escapes "\n'.repeat(1200) + "REPORT_END");
+  const stateDir = path.join(dataDir, "state", fs.readdirSync(path.join(dataDir, "state"))[0]);
+  const stored = JSON.parse(fs.readFileSync(path.join(stateDir, "jobs", jobId + ".json"), "utf8"));
+  assert.equal(stored.status, "completed");
+  assert.equal(stored.result.rawOutput, report);
+  for (const invalid of ["-1", "1.5", String(report.length + 1)]) {
+    const result = run("node", [SCRIPT, "result", jobId, "--cwd", repo, "--final", "--offset", invalid, "--json"], { cwd: ROOT, env });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /--offset must be an integer within the final report/);
+  }
+});
+
+test("task-worker aborts on empty EOF without starting Codex", async () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const worker = spawn(process.execPath, [SCRIPT, "task-worker", "--cwd", repo, "--job-id", "task-aborted"], {
+    cwd: repo, env: buildEnv(binDir), stdio: ["pipe", "ignore", "pipe"]
+  });
+  const exited = once(worker, "exit");
+  worker.stdin.end();
+  const [code] = await exited;
+  assert.equal(code, 0);
+  assert.equal(fs.existsSync(path.join(binDir, "fake-codex-state.json")), false);
+  assert.equal(fs.existsSync(path.join(resolveStateDir(repo), "jobs", "task-aborted.json")), false);
+});
+
+test("cancel terminates a queued worker before its release gate opens", async (t) => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+  const worker = spawn(process.execPath, [SCRIPT, "task-worker", "--cwd", repo, "--job-id", "task-queued"], {
+    cwd: repo, env, detached: true, stdio: ["pipe", "ignore", "ignore"]
+  });
+  const exited = once(worker, "exit");
+  t.after(() => { try { process.kill(worker.pid); } catch {} });
+  const job = { id: "task-queued", status: "queued", phase: "queued", pid: worker.pid, title: "Queued task", jobClass: "task", request: { cwd: repo, prompt: "must never run" } };
+  writeJobFile(repo, job.id, job);
+  upsertJob(repo, job);
+  const cancelled = run("node", [SCRIPT, "cancel", job.id, "--json"], { cwd: repo, env });
+  assert.equal(cancelled.status, 0, cancelled.stderr);
+  assert.equal(JSON.parse(cancelled.stdout).status, "cancelled");
+  await exited;
+  const stored = JSON.parse(fs.readFileSync(path.join(resolveStateDir(repo), "jobs", job.id + ".json"), "utf8"));
+  assert.equal(stored.status, "cancelled");
+  assert.equal(fs.existsSync(path.join(binDir, "fake-codex-state.json")), false);
+  const final = run("node", [SCRIPT, "result", job.id, "--final", "--json"], { cwd: repo, env });
+  assert.equal(final.status, 1);
+  assert.match(final.stderr, /cancelled/);
+});
+
+test("failed queue persistence aborts the worker and reports its exact ID", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir);
+  initGitRepo(repo);
+  const stateDir = resolveStateDir(repo);
+  fs.mkdirSync(path.join(stateDir, "state.json"), { recursive: true });
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "must never run"], { cwd: repo, env: buildEnv(binDir) });
+  assert.equal(launched.status, 1);
+  assert.match(launched.stderr, /Background job task-.* failed to start:.*EISDIR/);
+  const jobsDir = path.join(stateDir, "jobs");
+  const files = fs.readdirSync(jobsDir).filter((name) => name.endsWith(".json"));
+  assert.equal(files.length, 1);
+  const stored = JSON.parse(fs.readFileSync(path.join(jobsDir, files[0]), "utf8"));
+  assert.equal(stored.status, "failed");
+  assert.equal(stored.pid, null);
+  assert.equal(fs.existsSync(path.join(binDir, "fake-codex-state.json")), false);
+});
+
+
+test("a completed job without a final report fails explicit final delivery", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "empty-final-task");
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "review the change"], { cwd: repo, env });
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+  const waited = run("node", [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "15000", "--json"], { cwd: repo, env });
+  assert.equal(waited.status, 0, waited.stderr);
+  assert.equal(JSON.parse(waited.stdout).job.status, "completed");
+  const final = run("node", [SCRIPT, "result", jobId, "--final", "--json"], { cwd: repo, env });
+  assert.equal(final.status, 1);
+  assert.match(final.stderr, /completed without a final report/);
+  assert.match(final.stderr, new RegExp(jobId));
+});
+
+
+test("failed background tasks preserve the actionable error in status and final retrieval", () => {
+  const repo = makeTempDir();
+  const binDir = makeTempDir();
+  installFakeCodex(binDir, "failed-task");
+  initGitRepo(repo);
+  const env = buildEnv(binDir);
+  const launched = run("node", [SCRIPT, "task", "--background", "--json", "review the change"], { cwd: repo, env });
+  assert.equal(launched.status, 0, launched.stderr);
+  const { jobId } = JSON.parse(launched.stdout);
+  const waited = run("node", [SCRIPT, "status", jobId, "--wait", "--timeout-ms", "15000", "--json"], { cwd: repo, env });
+  assert.equal(waited.status, 0, waited.stderr);
+  const { job } = JSON.parse(waited.stdout);
+  assert.equal(job.status, "failed");
+  assert.equal(job.errorMessage, "Intentional task failure");
+  const final = run("node", [SCRIPT, "result", jobId, "--final", "--json"], { cwd: repo, env });
+  assert.equal(final.status, 1);
+  assert.match(final.stderr, /Intentional task failure/);
+  assert.match(final.stderr, new RegExp(jobId));
 });

@@ -158,6 +158,7 @@ export async function runTrackedJob(job, runner, options = {}) {
     writeJobFile(job.workspaceRoot, job.id, {
       ...runningRecord,
       status: completionStatus,
+      errorMessage: execution.errorMessage ?? null,
       threadId: execution.threadId ?? null,
       turnId: execution.turnId ?? null,
       pid: null,
@@ -169,6 +170,7 @@ export async function runTrackedJob(job, runner, options = {}) {
     upsertJob(job.workspaceRoot, {
       id: job.id,
       status: completionStatus,
+      errorMessage: execution.errorMessage ?? null,
       threadId: execution.threadId ?? null,
       turnId: execution.turnId ?? null,
       summary: execution.summary,

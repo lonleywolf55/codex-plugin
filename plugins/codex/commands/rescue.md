@@ -7,6 +7,7 @@ allowed-tools: Bash(node:*), AskUserQuestion, Agent
 Invoke the `codex:codex-rescue` subagent via the `Agent` tool (`subagent_type: "codex:codex-rescue"`), forwarding the raw user request as the prompt.
 `codex:codex-rescue` is a subagent, not a skill — do not call `Skill(codex:codex-rescue)` (no such skill) or `Skill(codex:rescue)` (that re-enters this command and hangs the session). The command runs inline so the `Agent` tool stays in scope; forked general-purpose subagents do not expose it.
 The final user-visible response must be Codex's output verbatim.
+If the `Agent` return is paginated, retrieve every remaining page through the actually exposed MCP tool whose name ends in `bouncer_page`, using the returned snapshot ID and page numbers, before handing back the complete final report. Do not call bare `bouncer_page`, return a partial report or substitute a summary. If pagination is unavailable or retrieval fails, report that failure with the job ID instead of claiming a complete result.
 
 Raw user request:
 $ARGUMENTS
@@ -16,7 +17,7 @@ Execution mode:
 - If the request includes `--background`, run the `codex:codex-rescue` subagent in the background.
 - If the request includes `--wait`, run the `codex:codex-rescue` subagent in the foreground.
 - If neither flag is present, default to foreground.
-- `--background` and `--wait` are execution flags for Claude Code. Do not forward them to `task`, and do not treat them as part of the natural-language task text.
+- `--background` and `--wait` select whether Claude waits for the subagent. Strip them from the task text; the subagent always launches one durable `task --background --json` job and retrieves its complete final report.
 - `--model` and `--effort` are runtime-selection flags. Preserve them for the forwarded `task` call, but do not treat them as part of the natural-language task text.
 - If the request includes `--resume`, do not ask whether to continue. The user already chose.
 - If the request includes `--fresh`, do not ask whether to continue. The user already chose.
@@ -38,10 +39,11 @@ node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task-resume-candidate -
 
 Operating rules:
 
-- The subagent is a thin forwarder only. It should use one `Bash` call to invoke `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-companion.mjs" task ...` and return that command's stdout as-is.
-- Return the Codex companion stdout verbatim to the user.
+- The subagent is a thin forwarder only: launch one background task, wait on its exact job ID, then fetch every bounded final-report slice from that same job.
+- Return the complete Codex final report verbatim to the user. Progress, a launch receipt or a successful wait timeout is not a review verdict.
 - Do not paraphrase, summarize, rewrite, or add commentary before or after it.
-- Do not ask the subagent to inspect files, monitor progress, poll `/codex:status`, fetch `/codex:result`, call `/codex:cancel`, summarize output, or do follow-up work of its own.
+- The subagent must use the runtime `status --brief` and `result --final` commands to retrieve the full final response, including all slices. Never relaunch after a bounded wait timeout. Keep its exact job ID, workspace and plugin-data root fixed. Do not ask it to inspect files, call `/codex:cancel`, summarize output or do independent follow-up work.
+- Surface launch, wait and retrieval failures with the exact job ID when available; never return an empty response or present progress as completion.
 - Leave `--effort` unset unless the user explicitly asks for a specific reasoning effort.
 - Leave the model unset unless the user explicitly asks for one. If they ask for `spark`, map it to `gpt-5.3-codex-spark`.
 - Leave `--resume` and `--fresh` in the forwarded request. The subagent handles that routing when it builds the `task` command.
